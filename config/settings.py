@@ -40,8 +40,22 @@ load_dotenv(dotenv_path=BASE_DIR / ".env")
 
 # NASA FIRMS API Settings
 FIRMS_MAP_KEY: str = os.getenv("FIRMS_MAP_KEY", "")
+
+# Optional comma-separated pool of MAP_KEYs. Requests round-robin across them and fail
+# over on error. Each key carries its own 5000/10-min budget.
+FIRMS_MAP_KEYS: List[str] = [
+    k.strip() for k in os.getenv("FIRMS_MAP_KEYS", FIRMS_MAP_KEY).split(",") if k.strip()
+]
 FIRMS_BASE_URL: str = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
 FIRMS_SOURCE: str = "VIIRS_SNPP_NRT"
+
+# Verified against GET /api/data_availability/csv/{KEY}/ALL on 2026-09-09:
+#   VIIRS_SNPP_SP   2012-01-20 .. 2026-04-27
+#   VIIRS_SNPP_NRT  2026-04-28 .. present   (seamless handover, no gap)
+# Requesting a date outside a sensor's window returns an empty CSV, not an error,
+# so historical pulls silently yielded nothing while the source was pinned to NRT.
+FIRMS_SOURCE_ARCHIVE: str = "VIIRS_SNPP_SP"
+FIRMS_NRT_START_DATE: str = "2026-04-28"
 
 # =====================================================================
 # India Regional Registry (Single Source of Truth for Bounding Boxes)
@@ -81,6 +95,18 @@ REGIONS: Dict[str, Dict[str, Any]] = {
 }
 
 # Alias for backwards compatibility or alternative naming
+REGIONS["punjab_haryana"] = {
+    "name": "punjab_haryana",
+    "label": "Punjab & Haryana Agricultural Belt (Ludhiana, Patiala, Karnal, Hisar)",
+    "bbox": {"west": 73.8, "south": 29.3, "east": 77.6, "north": 32.6},
+    "description": "Paddy and wheat stubble burning belt. Required for agricultural_burn labels.",
+}
+REGIONS["rajasthan_solar"] = {
+    "name": "rajasthan_solar",
+    "label": "Bhadla Solar Park & Thar Renewable Zone",
+    "bbox": {"west": 71.4, "south": 27.1, "east": 72.4, "north": 28.0},
+    "description": "Large solar installations. Required for known_false_positive labels.",
+}
 REGIONS["gujarat_jamnagar"] = REGIONS["gujarat"]
 
 
@@ -165,7 +191,11 @@ FACILITY_PROXIMITY_THRESHOLD_M: float = 500.0
 H3_RESOLUTION: int = 8
 
 # Model A (Classifier) Hyperparameters
+# n_jobs=1 is deliberate. Measured on an M4 at 2,000 rows x 19 features:
+#   n_jobs=1 -> 1.27s | n_jobs=2 -> 2.21s | n_jobs=4 -> 2.65s | n_jobs=8 -> 6.11s
+# Thread sync dominates at this data size; parallelism only pays above ~200k rows.
 MODEL_A_PARAMS: Dict = {
+    "n_jobs": 1,
     "objective": "multiclass",
     "num_class": len(EVENT_TYPES),
     "num_leaves": 31,
@@ -176,7 +206,11 @@ MODEL_A_PARAMS: Dict = {
 }
 
 # Model C (24h Risk Escalation) Hyperparameters
+# n_jobs=1 is deliberate. Measured on an M4 at 2,000 rows x 19 features:
+#   n_jobs=1 -> 1.27s | n_jobs=2 -> 2.21s | n_jobs=4 -> 2.65s | n_jobs=8 -> 6.11s
+# Thread sync dominates at this data size; parallelism only pays above ~200k rows.
 MODEL_C_PARAMS: Dict = {
+    "n_jobs": 1,
     "objective": "binary",
     "num_leaves": 31,
     "learning_rate": 0.05,

@@ -106,8 +106,41 @@ def build_feature_table(
     # 3. Extract temporal indicators (month, is_agri_burn_season)
     df_feat = extract_temporal_features(df_feat)
 
+    # 4a. FIRMS ships the thermal bands as bright_ti4 / bright_ti5. The defaults block
+    # below names them brightness_ti4 / brightness_ti5, so those columns never existed
+    # and were created as the literal constants 315.0 / 295.0 for every row -- two of
+    # Model A's eighteen features carrying zero information. Alias them first.
+    for src, dst in (("bright_ti4", "brightness_ti4"), ("bright_ti5", "brightness_ti5")):
+        if src in df_feat.columns:
+            if dst not in df_feat.columns:
+                df_feat[dst] = df_feat[src]
+            else:
+                df_feat[dst] = df_feat[dst].where(df_feat[dst].notna(), df_feat[src])
+
+    # 4b. Two physical discriminators FIRMS does not ship directly.
+    #  delta_bt   = 4um minus 11um brightness temperature. A hot, compact source (flare,
+    #               furnace, explosion) shows a large split; a cooler spreading vegetation
+    #               front shows a small one. bright_ti4 saturates at 367K, so the split
+    #               also encodes "this pixel pegged the sensor".
+    #  frp_density= radiative power per unit pixel footprint (MW/km2). VIIRS pixels grow
+    #               toward swath edge, so raw FRP conflates intensity with pixel size;
+    #               dividing by scan*track separates them.
+    if {"bright_ti4", "bright_ti5"}.issubset(df_feat.columns):
+        df_feat["delta_bt"] = (
+            pd.to_numeric(df_feat["bright_ti4"], errors="coerce")
+            - pd.to_numeric(df_feat["bright_ti5"], errors="coerce")
+        )
+    if {"scan", "track"}.issubset(df_feat.columns):
+        area = (pd.to_numeric(df_feat["scan"], errors="coerce")
+                * pd.to_numeric(df_feat["track"], errors="coerce"))
+        df_feat["frp_density"] = (
+            pd.to_numeric(df_feat["frp"], errors="coerce") / area.where(area > 0)
+        )
+
     # 4. Fill defaults for missing numeric or spatial fields
     defaults = {
+        "delta_bt": 0.0,
+        "frp_density": 0.0,
         "brightness_ti4": 315.0,
         "brightness_ti5": 295.0,
         "confidence": 80.0,

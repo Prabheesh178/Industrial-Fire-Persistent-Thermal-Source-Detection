@@ -19,8 +19,11 @@ OUTPUT:
 
 STRICT RULES OBSERVED:
     - Training scope MUST filter to locations with duty_cycle < 0.2 (excludes steady flaring facilities to prevent leakage).
-    - Target label = 1 if within next 24h: (a) max FRP exceeds 2x current reading OR (b) cluster grows (cluster_growth_rate > 0).
-    - NEVER uses "detected again within 24h" as target.
+    - Target label is CURRENTLY a present-tense heuristic, not a 24h look-ahead. See
+      derive_target_labels() for the measured leakage this causes (ROC AUC 1.0000).
+      The intended target -- max FRP over the next 24h exceeding 2x current, or the
+      cluster footprint growing -- is not yet implemented.
+    - Does NOT use "detected again within 24h" as target (that would measure persistence).
     - Feature set = full feature table MINUS `days_active_last_30` (explicitly dropped for this model only to prevent target leakage).
 """
 
@@ -96,8 +99,33 @@ class ModelCRiskModel:
 
     def derive_target_labels(self, df: pd.DataFrame) -> pd.Series:
         """
-        Constructs the strict ground truth target for 24h escalation:
-        Target = 1 if max FRP within next 24h exceeds 2x current reading OR cluster_growth_rate > 0.5.
+        Present-tense escalation heuristic. NOT a 24-hour forecast.
+
+        WARNING -- read before quoting any metric from this model.
+
+        This function does not look ahead. There is no groupby, no shift, and no time
+        window: it evaluates a static rule on the CURRENT row.
+
+            growth > 0.5
+            or (z > 2.5 and wind > 15.0)
+            or (frp > 60.0 and growth > 0.0)
+
+        All four inputs -- cluster_growth_rate, frp_zscore_vs_facility_baseline,
+        wind_speed and frp -- are members of MODEL_C_FEATURES, so the model is trained to
+        predict a deterministic function of its own inputs. Measured consequence on a
+        9,206-row corpus (8,671 rows after the duty_cycle filter):
+
+            full MODEL_C_FEATURES              accuracy 99.94%   ROC AUC 1.0000
+            ONLY the 4 target-defining columns accuracy 99.94%   ROC AUC 1.0000
+            MODEL_C_FEATURES minus those 4     accuracy 91.30%   ROC AUC 0.8398
+
+        An AUC of exactly 1.0 reproduced by four columns alone is label leakage, not
+        skill. Treat the output as a re-expression of the rule above.
+
+        To make this an actual forecast: group the persistence log by location_key,
+        shift the FRP series forward 24h, and label 1 where the forward-looking max
+        exceeds 2x the current reading or the cluster footprint grew. That requires
+        contiguous daily coverage per cell, which the corpus does not yet guarantee.
         """
         targets = []
         for _, row in df.iterrows():

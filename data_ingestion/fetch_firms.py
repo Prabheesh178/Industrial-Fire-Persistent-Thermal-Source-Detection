@@ -26,6 +26,7 @@ import os
 import sys
 import io
 import time
+import itertools
 import argparse
 from datetime import datetime, timedelta
 from typing import Optional, List
@@ -37,6 +38,9 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config.settings import (
     FIRMS_MAP_KEY,
+    FIRMS_MAP_KEYS,
+    FIRMS_SOURCE_ARCHIVE,
+    FIRMS_NRT_START_DATE,
     FIRMS_BASE_URL,
     FIRMS_SOURCE,
     DEFAULT_BBOX,
@@ -64,6 +68,54 @@ REQUIRED_FIRMS_COLUMNS = [
 ]
 
 
+_KEY_CURSOR = itertools.count()
+
+
+def next_map_key() -> str:
+    """Round-robin across the configured MAP_KEY pool. Each key has its own
+    5000/10-min budget; rotation also survives one key being throttled or revoked."""
+    pool = FIRMS_MAP_KEYS or [FIRMS_MAP_KEY]
+    return pool[next(_KEY_CURSOR) % len(pool)]
+
+
+def select_sensor(date_str: Optional[str] = None) -> str:
+    """NRT only serves recent dates and SP only serves older ones; a request outside a
+    sensor's window returns an empty CSV rather than an error. Pick by date so historical
+    pulls do not silently come back empty."""
+    if not date_str:
+        return FIRMS_SOURCE
+    try:
+        return FIRMS_SOURCE if date_str >= FIRMS_NRT_START_DATE else FIRMS_SOURCE_ARCHIVE
+    except TypeError:
+        return FIRMS_SOURCE
+
+
+def normalise_confidence(df: pd.DataFrame) -> pd.DataFrame:
+    """VIIRS reports confidence as a letter, MODIS as 0-100. Downstream code assumes a
+    number: persistence_log does float(row["confidence"]), api/schemas types it as float,
+    and OUTPUT_SCHEMA documents "0 - 100". On real VIIRS data that raises
+    `ValueError: could not convert string to float: 'n'`.
+
+    It never surfaced because the synthetic generator emits uniform(75, 100), so every
+    run before this one exercised numbers that real FIRMS does not return.
+
+    Mapped to the midpoints of the confidence bands FIRMS documents for VIIRS.
+    """
+    if "confidence" not in df.columns:
+        return df
+    out = df.copy()
+    letters = {"l": 30.0, "n": 70.0, "h": 95.0}
+    out["confidence"] = (
+        pd.to_numeric(
+            out["confidence"].astype(str).str.strip().str.lower().map(letters).fillna(
+                pd.to_numeric(out["confidence"], errors="coerce")),
+            errors="coerce")
+        .fillna(70.0)
+        .astype(float)
+    )
+    return out
+
+
 def fetch_firms_batch(
     map_key: str,
     west: float,
@@ -87,7 +139,8 @@ def fetch_firms_batch(
     Returns:
         DataFrame of active fire hotspot detections.
     """
-    day_range = min(max(int(day_range), 1), 10)
+    # The Area API rejects anything above 5: 'Invalid day range. Expects [1..5].'
+    day_range = min(max(int(day_range), 1), 5)
     bbox_str = f"{west},{south},{east},{north}"
 
     if date_str:
@@ -112,7 +165,7 @@ def fetch_firms_batch(
             for col in REQUIRED_FIRMS_COLUMNS:
                 if col not in df.columns:
                     df[col] = np.nan
-            return df[REQUIRED_FIRMS_COLUMNS]
+            return normalise_confidence(df[REQUIRED_FIRMS_COLUMNS])
         else:
             print(f"[FIRMS] HTTP Error {response.status_code}: {response.text[:200]}")
             return pd.DataFrame(columns=REQUIRED_FIRMS_COLUMNS)
@@ -240,6 +293,7 @@ def fetch_firms_hotspots(
     north: Optional[float] = None,
     total_days: int = 30,
     map_key: Optional[str] = None,
+    start_date: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Fetches FIRMS active fire hotspots over a multi-week period, batching by 7-day
@@ -273,22 +327,31 @@ def fetch_firms_hotspots(
     all_dfs: List[pd.DataFrame] = []
     
     # Batch requests in 7-day increments
-    batch_size = 7
+    # DATE is the START of the window (verified: /5/2026-08-01 returns 08-01..08-05),
+    # so batches must walk FORWARD from the oldest date. The previous loop passed
+    # datetime.now() for batch 0, which requested five days into the future.
+    batch_size = 5
     num_batches = (total_days + batch_size - 1) // batch_size
+    # start_date pins an explicit historical window; without it we walk back from today.
+    if start_date:
+        window_start = datetime.strptime(start_date, "%Y-%m-%d")
+    else:
+        window_start = datetime.now() - timedelta(days=total_days - 1)
 
     for i in range(num_batches):
         days_in_batch = min(batch_size, total_days - (i * batch_size))
-        end_date = datetime.now() - timedelta(days=i * batch_size)
-        date_str = end_date.strftime("%Y-%m-%d")
+        batch_start = window_start + timedelta(days=i * batch_size)
+        date_str = batch_start.strftime("%Y-%m-%d")
 
         df_batch = fetch_firms_batch(
-            map_key=key,
+            map_key=next_map_key(),
             west=w,
             south=s,
             east=e,
             north=n,
             day_range=days_in_batch,
             date_str=date_str,
+            sensor=select_sensor(date_str),
         )
 
         if not df_batch.empty:
@@ -299,8 +362,12 @@ def fetch_firms_hotspots(
             time.sleep(0.5)
 
     if not all_dfs:
-        print("[FIRMS] No live data returned from API, generating fallback data.")
-        return generate_synthetic_firms_sample(w, s, e, n, days=total_days)
+        # A configured key that returns nothing is real information ("no fires in this
+        # bbox/window"). Fabricating synthetic rows here is how a pipeline ends up
+        # trained on invented data with nothing on screen saying so.
+        print("[FIRMS] WARNING: key configured but zero detections returned for "
+              f"[{w},{s},{e},{n}] over {total_days}d. Returning EMPTY frame, not synthetic.")
+        return pd.DataFrame(columns=REQUIRED_FIRMS_COLUMNS)
 
     consolidated = pd.concat(all_dfs, ignore_index=True)
     consolidated.drop_duplicates(subset=["latitude", "longitude", "acq_date", "acq_time"], inplace=True)
@@ -317,6 +384,8 @@ if __name__ == "__main__":
     parser.add_argument("--east", type=float, default=None, help="Optional raw east bbox override")
     parser.add_argument("--north", type=float, default=None, help="Optional raw north bbox override")
     parser.add_argument("--days", type=int, default=14)
+    parser.add_argument("--start-date", dest="start_date", type=str, default=None,
+                        help="Window START in YYYY-MM-DD. Omit to walk back from today.")
     parser.add_argument("--output", type=str, default="data/firms_raw.csv")
     args = parser.parse_args()
 
@@ -327,6 +396,7 @@ if __name__ == "__main__":
         east=args.east,
         north=args.north,
         total_days=args.days,
+            start_date=args.start_date,
     )
     
     out_path = Path(args.output)

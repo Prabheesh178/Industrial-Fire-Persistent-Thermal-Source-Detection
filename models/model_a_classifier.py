@@ -59,6 +59,8 @@ MODEL_A_FEATURES = [
     "dist_to_populated_area_m",
     "dist_to_critical_infra_m",
     "cluster_growth_rate",
+    "delta_bt",
+    "frp_density",
 ]
 
 CATEGORICAL_FEATURES = ["daynight", "nearest_industrial_type", "land_cover_class"]

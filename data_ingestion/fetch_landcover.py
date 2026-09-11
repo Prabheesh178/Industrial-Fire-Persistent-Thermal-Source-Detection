@@ -23,6 +23,10 @@ STRICT RULES OBSERVED:
 """
 
 import os
+import json
+import rasterio
+import math
+import atexit
 import sys
 import argparse
 from typing import Dict
@@ -31,6 +35,7 @@ import pandas as pd
 
 # Ensure module import works when run as script
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from config.settings import DATA_DIR
 
 # ESA WorldCover 10m class map
 ESA_WORLDCOVER_MAP: Dict[int, str] = {
@@ -48,92 +53,112 @@ ESA_WORLDCOVER_MAP: Dict[int, str] = {
 }
 
 # Local in-memory cache to prevent redundant point queries
-_LANDCOVER_CACHE: Dict[str, str] = {}
+# Disk-backed so the cache survives the process. Each miss is a ~0.3s HTTP round trip to
+# openlandmap; on a 5,000-point pull an in-memory-only cache means re-paying 20-40 minutes
+# on every re-run, which dominates the pipeline's wall-clock.
+_LANDCOVER_CACHE_PATH = DATA_DIR / "landcover_cache.json"
+
+
+def _load_landcover_cache() -> Dict[str, str]:
+    try:
+        with open(_LANDCOVER_CACHE_PATH, "r") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_landcover_cache() -> None:
+    """Atomic write so an interrupted run cannot leave a truncated cache behind."""
+    try:
+        _LANDCOVER_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _LANDCOVER_CACHE_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w") as fh:
+            json.dump(_LANDCOVER_CACHE, fh)
+        os.replace(tmp, _LANDCOVER_CACHE_PATH)
+    except OSError as exc:
+        print(f"[LandCover] Could not persist cache: {exc}")
+
+
+_LANDCOVER_CACHE: Dict[str, str] = _load_landcover_cache()
+if _LANDCOVER_CACHE:
+    print(f"[LandCover] Reusing {len(_LANDCOVER_CACHE)} cached point lookups from disk.", file=sys.stderr)
+atexit.register(save_landcover_cache)
+
+
+ESA_WORLDCOVER_BASE = (
+    "https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map"
+)
+
+
+def _esa_tile_url(lat: float, lon: float) -> str:
+    """ESA WorldCover v200 tiles are 3x3 degree, named by their SW corner."""
+    la = math.floor(lat / 3.0) * 3
+    lo = math.floor(lon / 3.0) * 3
+    ns = f"N{la:02d}" if la >= 0 else f"S{abs(la):02d}"
+    ew = f"E{lo:03d}" if lo >= 0 else f"W{abs(lo):03d}"
+    return f"{ESA_WORLDCOVER_BASE}/ESA_WorldCover_10m_2021_v200_{ns}{ew}_Map.tif"
+
+
+def _cache_key(lat: float, lon: float) -> str:
+    return f"{round(lat, 3)}_{round(lon, 3)}"
 
 
 def sample_landcover_point(lat: float, lon: float, timeout: int = 5) -> str:
-    """
-    Point-samples ESA WorldCover land cover class at a specific (lat, lon) coordinate
-    using lightweight cloud REST queries without downloading raster tiles.
-
-    Args:
-        lat: Latitude in degrees.
-        lon: Longitude in degrees.
-        timeout: Request timeout in seconds.
-
-    Returns:
-        Standardized class string ('forest', 'grassland', 'cropland', 'built_up', 'barren', 'water', 'wetland').
-    """
-    # Round coordinate to ~100m grid for caching
-    cache_key = f"{round(lat, 3)}_{round(lon, 3)}"
-    if cache_key in _LANDCOVER_CACHE:
-        return _LANDCOVER_CACHE[cache_key]
-
-    # Try OpenLandMap / Planetary Computer STAC point query
-    try:
-        url = f"https://api.openlandmap.org/query/point?lat={lat}&lon={lon}&coll=lc_mcd12q1"
-        resp = requests.get(url, timeout=timeout)
-        if resp.status_code == 200:
-            val = resp.json().get("value")
-            if val is not None:
-                # Map OpenLandMap IGBP class
-                code = int(val)
-                if code in [1, 2, 3, 4, 5]:
-                    res = "forest"
-                elif code in [6, 7, 8, 9]:
-                    res = "grassland"
-                elif code in [12, 14]:
-                    res = "cropland"
-                elif code == 13:
-                    res = "built_up"
-                elif code in [0, 11, 15]:
-                    res = "water"
-                elif code == 16:
-                    res = "barren"
-                else:
-                    res = "cropland"
-                _LANDCOVER_CACHE[cache_key] = res
-                return res
-    except Exception:
-        pass
-
-    # Deterministic spatial heuristic fallback if cloud API is unreachable
-    # (Based on geographic heuristics for Indian subcontinent)
-    lat_val = float(lat)
-    lon_val = float(lon)
-    
-    # Coastal/Water check
-    if lon_val < 72.6 and lat_val < 21.2:
-        res = "water"
-    elif (lat_val * 100) % 7 < 2:
-        res = "forest"
-    elif (lat_val * 100) % 7 in [2, 3, 4]:
-        res = "cropland"
-    elif (lat_val * 100) % 7 == 5:
-        res = "grassland"
-    else:
-        res = "built_up"
-
-    _LANDCOVER_CACHE[cache_key] = res
-    return res
+    """Single-point land cover. Prefer sample_landcover_for_hotspots for bulk work:
+    it groups points by tile and opens each COG once."""
+    return sample_landcover_for_hotspots(
+        pd.DataFrame({"latitude": [lat], "longitude": [lon]})
+    ).iloc[0]
 
 
 def sample_landcover_for_hotspots(df_hotspots: pd.DataFrame) -> pd.Series:
+    """Land cover per hotspot, read from ESA WorldCover 10m COGs on S3.
+
+    Replaces an openlandmap query that never succeeded: the endpoint requires both
+    `coll` and `regex` and returned HTTP 422 for every call, so the module always fell
+    through to a `(latitude * 100) % 7` heuristic. That made land_cover_class a hash of
+    the latitude digits -- and land_cover_class is both a model feature and the sole
+    basis for the agricultural_burn and wildfire label rules, so those labels were
+    being assigned by modular arithmetic on a coordinate the model can also see.
+
+    Points are grouped by 3x3 degree tile so each COG is opened once and read with HTTP
+    range requests; the raster is never downloaded in full.
     """
-    Point-samples land cover class for all rows in a hotspots DataFrame.
-    """
-    if df_hotspots.empty:
+    if df_hotspots is None or df_hotspots.empty:
         return pd.Series([], dtype=str)
 
-    classes = []
-    for _, row in df_hotspots.iterrows():
-        lat = float(row["latitude"])
-        lon = float(row["longitude"])
-        c = sample_landcover_point(lat, lon)
-        classes.append(c)
+    lats = df_hotspots["latitude"].astype(float).to_numpy()
+    lons = df_hotspots["longitude"].astype(float).to_numpy()
+    out = [None] * len(lats)
 
-    return pd.Series(classes, index=df_hotspots.index)
+    pending: Dict[str, list] = {}
+    for i, (la, lo) in enumerate(zip(lats, lons)):
+        ck = _cache_key(la, lo)
+        hit = _LANDCOVER_CACHE.get(ck)
+        if hit is not None:
+            out[i] = hit
+        else:
+            pending.setdefault(_esa_tile_url(la, lo), []).append((i, la, lo, ck))
 
+    for url, items in pending.items():
+        try:
+            with rasterio.open(f"/vsicurl/{url}") as ds:
+                coords = [(lo, la) for _, la, lo, _ in items]
+                for (idx, _la, _lo, ck), val in zip(items, ds.sample(coords)):
+                    res = ESA_WORLDCOVER_MAP.get(int(val[0]), "barren")
+                    out[idx] = res
+                    _LANDCOVER_CACHE[ck] = res
+        except Exception as exc:
+            # A missing ocean tile is normal; anything else is worth seeing.
+            print(f"[LandCover] tile unavailable ({url.rsplit('/', 1)[-1]}): "
+                  f"{type(exc).__name__}. Marking {len(items)} points 'unknown'.")
+            for idx, _la, _lo, ck in items:
+                out[idx] = "unknown"
+                _LANDCOVER_CACHE[ck] = "unknown"
+
+    if pending:                    # only touch disk when something was actually fetched
+        save_landcover_cache()
+    return pd.Series(out, index=df_hotspots.index, dtype=str)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sample Land Cover at Specific Coordinates")

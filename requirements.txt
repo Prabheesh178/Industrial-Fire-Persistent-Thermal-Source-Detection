@@ -17,3 +17,6 @@ uvicorn[standard]>=0.24.0
 pydantic>=2.4.0
 python-dotenv>=1.0.0
 joblib>=1.3.0
+
+# Land cover: windowed reads of ESA WorldCover COGs over HTTP
+rasterio>=1.3.0
