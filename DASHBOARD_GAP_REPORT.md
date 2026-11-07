@@ -182,3 +182,4 @@ To keep all model logic, features, thresholds, class definitions, and `ScoreComb
    - Implement `fetchFacilityHistory(locationKey)` calling `GET /facility/{location_key}/history` and mapping to `FacilitySeries`.
    - Support all 7 canonical model classes in `src/lib/design.ts` (`industrial_flare`, `industrial_accident`, `stockpile_combustion`, `wildfire`, `agricultural_burn`, `known_false_positive`, `unknown_source`), while keeping backwards compatibility with the 6 snapshot class names when in offline demo mode.
    - Surface the exact `observed` (`frp`, `confidence`, `acq_date`, `nearest_industrial_type`, `dist_to_industrial_m`) and `inferred` (`event_type`, `event_type_confidence`, `anomaly_score_normalized`, `hazard_weight`, `exposure_factor`, `final_risk_score`, `escalating_24h`, `risk_24h`, `needs_manual_review`, `top_shap_features`) fields in `DetailDrawer.tsx` with strict visual separation.
+
