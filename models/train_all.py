@@ -3,17 +3,20 @@ End-to-End Training & Pipeline Orchestrator
 ===========================================
 
 HOW TO RUN:
-    Run the full end-to-end training and data pipeline:
+    Run the full end-to-end training and data pipeline from the repository root:
         python -m models.train_all
-    Or with custom parameters:
+    Or with a specific Indian region:
+        python -m models.train_all --region gujarat --days 30
+    Or with custom bounding box coordinates:
         python -m models.train_all --days 30 --west 72.5 --south 21.0 --east 73.5 --north 22.0
 
 INPUTS & ENVIRONMENT:
-    - FIRMS_MAP_KEY: NASA FIRMS Map Key in .env (falls back to realistic synthetic generator if omitted).
-    - DEFAULT_BBOX or CLI arguments for target region coordinates.
+    - FIRMS_MAP_KEY: NASA FIRMS Map Key in .env (falls back to synthetic generator if omitted).
+    - DEFAULT_REGION / REGIONS or CLI arguments for target region coordinates.
 
 OUTPUT:
     - Populates `data/hotspots.db` SQLite database with persistence history.
+    - Saves engineered feature snapshot to `data/feature_table.csv` and `data/labeled_dataset.csv`.
     - Saves trained model artifacts in `artifacts/`:
       * `artifacts/model_a.joblib` (LightGBM 7-class classifier + SHAP explainer)
       * `artifacts/facility_baselines.json` (Statistical Median + MAD baseline table)
@@ -32,18 +35,26 @@ STRICT PIPELINE EXECUTION SEQUENCE OBSERVED:
 import os
 import sys
 import time
+import json
+import sqlite3
 import argparse
+from pathlib import Path
+from typing import Optional, Dict, Any
 
 # Ensure module import works when run as script
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config.settings import (
+    BASE_DIR,
     DEFAULT_BBOX,
     DEFAULT_REGION,
     REGIONS,
     get_region_bbox,
+    FIRMS_MAP_KEY,
+    FIRMS_MAP_KEYS,
     DB_PATH,
     ARTIFACTS_DIR,
     DATA_DIR,
+    DB_DIR,
     OSM_CACHE_PATH,
 )
 from data_ingestion.fetch_firms import fetch_firms_hotspots
@@ -59,6 +70,137 @@ from models.model_c_risk_model import ModelCRiskModel
 from models.score_combiner import ScoreCombiner
 
 
+def _format_size(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024.0:.1f} KB"
+    return f"{num_bytes / (1024.0 * 1024.0):.2f} MB"
+
+
+def preflight_check() -> None:
+    """
+    Verifies required directories, environment variables, and cache files before
+    starting the training pipeline, printing a clear status message for anything missing.
+    """
+    print("=" * 70)
+    print("  PRE-FLIGHT ENVIRONMENT & CACHE CHECK")
+    print("=" * 70)
+
+    # 1. Required directories
+    for label, folder in [
+        ("Data directory", DATA_DIR),
+        ("Artifacts directory", ARTIFACTS_DIR),
+        ("Database schema directory", DB_DIR),
+    ]:
+        if folder.exists():
+            print(f"  [OK]      Folder exists: {label} ({folder.resolve()})")
+        else:
+            folder.mkdir(parents=True, exist_ok=True)
+            print(f"  [CREATED] Missing folder created: {label} ({folder.resolve()})")
+
+    # 2. Environment variables & .env file
+    env_file = BASE_DIR / ".env"
+    if env_file.exists():
+        print(f"  [OK]      .env configuration file found ({env_file.resolve()})")
+    else:
+        print(f"  [MISSING] .env file not found at {env_file.resolve()} (using process env / defaults)")
+
+    valid_key = bool(FIRMS_MAP_KEY and FIRMS_MAP_KEY.strip() and not FIRMS_MAP_KEY.startswith("your_"))
+    if valid_key:
+        print(f"  [OK]      FIRMS_MAP_KEY configured ({len(FIRMS_MAP_KEYS)} key(s) in rotation pool)")
+    else:
+        print(
+            "  [WARNING] FIRMS_MAP_KEY is missing or placeholder in .env!\n"
+            "            -> Pipeline will use the offline synthetic simulation generator.\n"
+            "            -> Set FIRMS_MAP_KEY in .env to ingest real NASA VIIRS detections."
+        )
+
+    print(f"  [OK]      DEFAULT_REGION={DEFAULT_REGION}")
+
+    # 3. Cache & database files
+    cache_files = [
+        ("OSM facility cache", Path(OSM_CACHE_PATH), "Will be fetched via Overpass API in Step 1"),
+        ("SQLite persistence DB", Path(DB_PATH), "Will be initialized and populated in Step 3"),
+        ("ESA WorldCover cache", DATA_DIR / "landcover_cache.json", "Will be populated via S3 COG reads in Step 4"),
+        ("Open-Meteo weather cache", DATA_DIR / "weather_cache.json", "Will be populated via Open-Meteo in Step 4"),
+    ]
+    for label, path, missing_note in cache_files:
+        if path.exists():
+            size_str = _format_size(path.stat().st_size)
+            print(f"  [OK]      {label}: {path.resolve()} ({size_str})")
+        else:
+            print(f"  [MISSING] {label} not found at {path.resolve()} -> {missing_note}")
+    print("=" * 70 + "\n")
+
+
+def print_completion_summary(
+    elapsed: float,
+    n_detections: int,
+    n_events: int,
+    anomaly_engine: ModelBAnomalyEngine,
+) -> None:
+    """
+    Prints the full path and size of every artifact saved, plus row counts for events,
+    facilities, and baselines.
+    """
+    # Count OSM facilities
+    n_osm_elements = 0
+    if Path(OSM_CACHE_PATH).exists():
+        try:
+            with open(OSM_CACHE_PATH, "r", encoding="utf-8") as fh:
+                osm_payload = json.load(fh)
+                n_osm_elements = len(osm_payload.get("elements", []))
+        except Exception:
+            n_osm_elements = 0
+
+    # Count SQLite history rows
+    n_db_rows = 0
+    if Path(DB_PATH).exists():
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM hotspot_history")
+                n_db_rows = int(cur.fetchone()[0] or 0)
+        except Exception:
+            n_db_rows = 0
+
+    n_fac_baselines = len(anomaly_engine.facility_baselines)
+    n_reg_baselines = len(anomaly_engine.regional_baselines)
+
+    print("\n" + "=" * 70)
+    print(f"  TRAINING PIPELINE SUMMARY (Completed in {elapsed:.2f}s)")
+    print("=" * 70)
+    print("  ROW & ENTITY COUNTS:")
+    print(f"    * Raw hotspot detections processed : {n_detections:,}")
+    print(f"    * Clustered thermal events         : {n_events:,}")
+    print(f"    * SQLite hotspot_history rows      : {n_db_rows:,}")
+    print(f"    * Cached OSM elements              : {n_osm_elements:,}")
+    print(f"    * Model B facility baselines       : {n_fac_baselines:,}")
+    print(f"    * Model B regional type baselines  : {n_reg_baselines:,}")
+
+    print("\n  SAVED ARTIFACTS & DATA FILES (Full Path & Size):")
+    expected_files = [
+        ARTIFACTS_DIR / "model_a.joblib",
+        ARTIFACTS_DIR / "facility_baselines.json",
+        ARTIFACTS_DIR / "model_c.joblib",
+         Path(DB_PATH),
+        DATA_DIR / "feature_table.csv",
+        DATA_DIR / "labeled_dataset.csv",
+        Path(OSM_CACHE_PATH),
+        DATA_DIR / "landcover_cache.json",
+        DATA_DIR / "weather_cache.json",
+    ]
+    for fp in expected_files:
+        abs_p = fp.resolve()
+        if abs_p.exists():
+            sz = _format_size(abs_p.stat().st_size)
+            print(f"    [SAVED]   {str(abs_p):<62} ({sz})")
+        else:
+            print(f"    [MISSING] {str(abs_p)}")
+    print("=" * 70)
+
+
 def run_training_pipeline(
     region: Optional[str] = None,
     west: Optional[float] = None,
@@ -70,6 +212,8 @@ def run_training_pipeline(
     """
     Executes the 7-step data ingestion, processing, baseline fitting, and model training sequence.
     """
+    preflight_check()
+
     # Resolve bounding box coordinates
     if west is None or south is None or east is None or north is None:
         target_region = region or DEFAULT_REGION
@@ -89,8 +233,8 @@ def run_training_pipeline(
     print(f"Target Region:       {target_region}")
     print(f"Target Bounding Box: West={w}, South={s}, East={e}, North={n}")
     print(f"Historical Window:   {days} days")
-    print(f"Artifacts Path:      {ARTIFACTS_DIR}")
-    print(f"Database Path:       {DB_PATH}\n")
+    print(f"Artifacts Path:      {ARTIFACTS_DIR.resolve()}")
+    print(f"Database Path:       {Path(DB_PATH).resolve()}\n")
 
     # -------------------------------------------------------------------------
     # STEP 1: Ingestion & Spatial Join (Boundary Distances)
@@ -102,7 +246,7 @@ def run_training_pipeline(
 
     # Cache OSM infrastructure
     fetch_osm_industrial_and_exposure(west=w, south=s, east=e, north=n)
-    
+
     # Boundary distance spatial join
     df_joined = perform_spatial_join(df_raw, str(OSM_CACHE_PATH))
     print(f" -> Spatial Join complete: {len(df_joined)} points processed with boundary distances.")
@@ -112,7 +256,7 @@ def run_training_pipeline(
     # -------------------------------------------------------------------------
     print("\n>>> [STEP 2/7] Running Spatiotemporal DBSCAN Clustering (Assign event_ids)...")
     df_clustered = cluster_hotspots_spatiotemporal(df_joined)
-    n_events = df_clustered["event_id"].nunique()
+    n_events = int(df_clustered["event_id"].nunique())
     print(f" -> Clustering complete: Formed {n_events} distinct thermal event clusters.")
 
     # -------------------------------------------------------------------------
@@ -120,16 +264,15 @@ def run_training_pipeline(
     # -------------------------------------------------------------------------
     print("\n>>> [STEP 3/7] Updating Hotspot Persistence History Database...")
     df_persisted = update_persistence_log(df_clustered, str(DB_PATH))
-    print(f" -> Persistence log updated. Computed days_active_last_30 and night_detection_fraction.")
+    print(" -> Persistence log updated. Computed days_active_last_30 and night_detection_fraction.")
 
     # -------------------------------------------------------------------------
     # STEP 4: Build Canonical Feature Engineering Table
     # -------------------------------------------------------------------------
     print("\n>>> [STEP 4/7] Constructing Full Feature Engineering Matrix...")
-    # Initialize Model B anomaly engine to compute z-scores for feature table
     anomaly_engine = ModelBAnomalyEngine(ARTIFACTS_DIR, DB_PATH)
     anomaly_engine.fit_from_db()
-    
+
     df_features = build_feature_table(df_persisted, anomaly_engine=anomaly_engine)
     feature_csv_path = DATA_DIR / "feature_table.csv"
     df_features.to_csv(feature_csv_path, index=False)
@@ -142,7 +285,7 @@ def run_training_pipeline(
     df_labeled = apply_labeling_heuristic(df_features)
     labeled_csv_path = DATA_DIR / "labeled_dataset.csv"
     df_labeled.to_csv(labeled_csv_path, index=False)
-    print(f" -> Pseudo-labeling complete. Class distribution:")
+    print(" -> Pseudo-labeling complete. Class distribution:")
     for cls_name, count in df_labeled["event_type"].value_counts().items():
         print(f"    * {cls_name:<25}: {count:>4} samples")
 
@@ -155,13 +298,17 @@ def run_training_pipeline(
     print("\n--- Training Model A (LightGBM Multi-Class Event Classifier) ---")
     model_a = ModelAClassifier(ARTIFACTS_DIR)
     metrics_a = model_a.train(df_labeled)
-    print(f" -> Model A trained. Validation Accuracy: {metrics_a.get('val_accuracy', 0.0):.2%}")
+    print(
+        f" -> Model A trained (train={metrics_a.get('n_train', 0)}, val={metrics_a.get('n_val', 0)} samples)."
+    )
 
     # Model C: LightGBM 24h Escalation Risk Model (Filtered duty_cycle < 0.2)
     print("\n--- Training Model C (LightGBM 24h Risk Escalation Model) ---")
     model_c = ModelCRiskModel(ARTIFACTS_DIR)
     metrics_c = model_c.train(df_labeled)
-    print(f" -> Model C trained. Mean validation escalation probability: {metrics_c.get('mean_risk_val', 0.0):.2%}")
+    print(
+        f" -> Model C trained (train={metrics_c.get('n_train', 0)}, val={metrics_c.get('n_val', 0)} samples)."
+    )
 
     # -------------------------------------------------------------------------
     # STEP 7: Score Combiner Verification
@@ -187,18 +334,25 @@ def run_training_pipeline(
     )
 
     print(" -> Sample End-to-End Scored Point:")
-    import json
     print(json.dumps(combined_score, indent=2))
 
     elapsed = round(time.time() - start_time, 2)
-    print("\n" + "=" * 70)
-    print(f"  ALL PIPELINE STEPS & MODELS TRAINED SUCCESSFULLY IN {elapsed}s")
-    print("=" * 70)
+    print_completion_summary(
+        elapsed=elapsed,
+        n_detections=len(df_raw),
+        n_events=n_events,
+        anomaly_engine=anomaly_engine,
+    )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="End-to-End Industrial Fire Pipeline & Model Trainer")
-    parser.add_argument("--region", type=str, default=DEFAULT_REGION, help=f"Named Indian industrial region ({', '.join(REGIONS.keys())})")
+    parser.add_argument(
+        "--region",
+        type=str,
+        default=DEFAULT_REGION,
+        help=f"Named Indian industrial region ({', '.join(REGIONS.keys())})",
+    )
     parser.add_argument("--west", type=float, default=None, help="Optional raw west bbox override")
     parser.add_argument("--south", type=float, default=None, help="Optional raw south bbox override")
     parser.add_argument("--east", type=float, default=None, help="Optional raw east bbox override")

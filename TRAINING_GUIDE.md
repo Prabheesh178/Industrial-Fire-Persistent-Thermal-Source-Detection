@@ -1,6 +1,40 @@
 # Model Training & Artifact Portability Guide (`TRAINING_GUIDE.md`)
 
-This guide is written for an engineer or operator setting up and training the **Industrial Fire & Persistent Thermal Source Detection** pipeline from scratch on a clean machine, verifying the trained artifacts, and copying them to the machine that serves the FastAPI backend.
+## Quick-Start Training Commands (`python -m models.train_all`)
+
+Run from the root of `Industrial-Fire-Persistent-Thermal-Source-Detection` after activating your virtual environment:
+
+**Windows PowerShell:**
+```powershell
+.\.venv\Scripts\Activate.ps1
+# Default demo region (Gujarat, 30 days):
+python -m models.train_all --region gujarat --days 30
+
+# Or specific region (maharashtra / odisha / chhattisgarh_jharkhand / all_india):
+python -m models.train_all --region all_india --days 30
+```
+
+**Windows Command Prompt (CMD):**
+```cmd
+.venv\Scripts\activate.bat
+REM Default demo region (Gujarat, 30 days):
+python -m models.train_all --region gujarat --days 30
+
+REM Or specific region (maharashtra / odisha / chhattisgarh_jharkhand / all_india):
+python -m models.train_all --region all_india --days 30
+```
+
+**Linux / macOS (Bash / Zsh):**
+```bash
+source .venv/bin/activate
+python -m models.train_all --region gujarat --days 30
+```
+
+> Note: `train_all.py` automatically runs a pre-flight check (`preflight_check()`) verifying folders, `.env`, `FIRMS_MAP_KEY`, and cache files before starting, and prints a completion summary (`print_completion_summary()`) with exact row counts and full absolute paths/sizes of all generated artifacts at the end.
+
+---
+
+This guide is written for an engineer or operator setting up and training the **Industrial Fire & Persistent Thermal Source Detection** pipeline from scratch on a clean machine, verifying the trained artifacts, and copying them to the machine or Render web service that serves the FastAPI backend.
 
 ---
 
@@ -345,3 +379,4 @@ Then start `uvicorn api.main:app --host 0.0.0.0 --port 8000`. The startup hook w
 | **`ABORT: OSM cache has only 6 elements -- that is the synthetic fallback, not real data`** (when running `tools/run_training.py`) | Overpass failed during an earlier run and `fetch_osm.py` wrote the 6-element synthetic fallback into `data/osm_cache.json`. | Delete `data/osm_cache.json` and run `python -m data_ingestion.fetch_osm --region gujarat --force` (or run `python tools/pbf_to_osm_cache.py` with Geofabrik PBFs). |
 | **`[LandCover] tile unavailable ... Marking N points 'unknown'`** | Temporary network timeout reading ESA WorldCover Cloud-Optimized GeoTIFFs via GDAL `/vsicurl/` from S3. | Re-run `python -m processing.feature_engineering`. Points already fetched are persisted in `data/landcover_cache.json`, so only missing tiles are retried. |
 | **`MemoryError` or slow hang in `Step 2: Spatiotemporal Clustering (DBSCAN)`** | Uncapped `all_india` pull returned $> 20,000$ rows, and `custom_spacetime_distance_matrix` allocates an $N \times N$ `float32` distance matrix in RAM. | Use `python tools/build_corpus.py` (which caps wildfire/stubble pulls to keep the balanced corpus at ~9,200 rows / ~340 MB RAM) or reduce `--days` when running on a single machine with limited RAM. |
+
