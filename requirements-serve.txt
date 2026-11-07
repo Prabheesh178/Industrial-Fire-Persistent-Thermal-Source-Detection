@@ -1,0 +1,18 @@
+# Lightweight Runtime Serving Dependencies for Render Web Service
+# Excludes heavy training/ingestion geospatial binaries (rasterio, geopandas, shapely, h3)
+# that are only needed when running `python -m models.train_all` locally.
+
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.4.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Model Inference & SHAP Explainability
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+lightgbm>=4.1.0
+shap>=0.43.0
+joblib>=1.3.0
+

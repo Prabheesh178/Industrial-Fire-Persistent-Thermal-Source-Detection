@@ -7,22 +7,100 @@ This document serves as the complete technical contract for frontend and dashboa
 ## 1. Core Design Principle: Observed vs. Inferred
 
 All hotspot payload objects strictly separate **Satellite Evidence (Observed)** from **Model AI Predictions (Inferred)**:
-- `observed`: Direct, un-manipulated satellite & GIS sensor data (FRP, satellite confidence, acquisition timestamp, nearest OSM facility boundary distance and type).
-- `inferred`: Synthesized intelligence produced by the machine learning classifiers and anomaly engine (event classification, anomaly score, hazard weighting, spatial exposure factor, final risk score, 24h escalation probability, and SHAP feature drivers).
+- `observed`: Direct, un-manipulated satellite & GIS sensor data (FRP peak/total/max, I4 brightness temperature, satellite confidence, acquisition date & UTC time, day/night pass, satellite sensor, ESA WorldCover land cover, and nearest OSM facility boundary distance, category, and name).
+- `inferred`: Synthesized intelligence produced by the machine learning classifiers and anomaly engine (event classification, signed z-score & boolean anomaly gate, normalized anomaly score, hazard weighting, spatial exposure factor, final risk score, 24h escalation probability, and signed SHAP feature drivers).
 
-> **Frontend Implementation Tip**: In your UI modal/side panel, visually delineate these two sections (e.g., a "Satellite Evidence" card with blue/neutral styling, and an "AI Risk Analysis" card with risk-colored styling).
+> **Frontend Implementation Tip**: Visually delineate these two sections in the UI and never merge observed satellite measurements with model inferences in the same table.
 
 ---
 
 ## 2. API Endpoints
 
-Base URL: `http://localhost:8000` (or your deployment host)  
-CORS: Enabled for all origins (`*`)  
+Base URL: `http://localhost:8000` (or your Render deployment URL)  
+CORS: Controlled via `CORS_ORIGINS` environment variable (comma-separated origins)  
 Format: `application/json`
 
 ---
 
-### Endpoint 1: `GET /regions`
+### Endpoint 1: `GET /health`
+
+Returns operational service status, dataset currency (`data_as_of`), active cluster count, and dynamically inspected model artifact file metadata (size and UTC modified timestamp read from disk — no hardcoded versions).
+
+- If required model artifacts (`artifacts/model_a.joblib`, `artifacts/facility_baselines.json`, `artifacts/model_c.joblib`) are missing, `status` is `"error"`, `missing_artifacts` lists each missing file, and `GET /hotspots` returns HTTP `503` with the same message instead of serving fake or heuristic numbers.
+
+#### Response Schema
+
+```typescript
+interface ArtifactInfo {
+  filename: string;
+  exists: boolean;
+  loaded: boolean;
+  size_bytes: number | null;
+  modified_at: string | null; // ISO-8601 UTC timestamp from filesystem mtime
+}
+
+interface HealthResponse {
+  status: "ok" | "error";
+  error: string | null;
+  missing_artifacts: string[];
+  data_as_of: string | null;  // Max acquisition timestamp in dataset (ISO-8601 UTC)
+  active_events_count: number;
+  model_artifacts: Record<string, ArtifactInfo>;
+}
+```
+
+#### Sample Response Payload (`GET /health`)
+
+```json
+{
+  "status": "ok",
+  "error": null,
+  "missing_artifacts": [],
+  "data_as_of": "2026-09-04T20:42:00Z",
+  "active_events_count": 18,
+  "model_artifacts": {
+    "model_a": {
+      "filename": "model_a.joblib",
+      "exists": true,
+      "loaded": true,
+      "size_bytes": 418920,
+      "modified_at": "2026-11-07T12:30:00Z"
+    },
+    "facility_baselines": {
+      "filename": "facility_baselines.json",
+      "exists": true,
+      "loaded": true,
+      "size_bytes": 14820,
+      "modified_at": "2026-11-07T12:29:50Z"
+    },
+    "model_c": {
+      "filename": "model_c.joblib",
+      "exists": true,
+      "loaded": true,
+      "size_bytes": 182410,
+      "modified_at": "2026-11-07T12:30:05Z"
+    },
+    "hotspots_db": {
+      "filename": "hotspots.db",
+      "exists": true,
+      "loaded": true,
+      "size_bytes": 245760,
+      "modified_at": "2026-11-07T12:29:45Z"
+    },
+    "osm_cache": {
+      "filename": "osm_cache.json",
+      "exists": true,
+      "loaded": true,
+      "size_bytes": 84120,
+      "modified_at": "2026-11-07T12:29:40Z"
+    }
+  }
+}
+```
+
+---
+
+### Endpoint 2: `GET /regions`
 
 Returns the registry of available predefined Indian industrial regions (name, human-readable label, bounding box, and industrial profile description) so that the frontend dashboard can render a dynamic region-picker dropdown.
 
@@ -106,9 +184,40 @@ interface RegionInfo {
 
 ---
 
-### Endpoint 2: `GET /hotspots`
+### Endpoint 3: `GET /facilities`
 
-Retrieves all active thermal hotspots for a specified Indian region or custom spatial bounding box, running the full ML pipeline and returning scored detections.
+Returns a GeoJSON `FeatureCollection` of industrial, refinery, power, solar, waste, and mining facilities parsed from the cached OpenStreetMap extract (`data/osm_cache.json`).
+
+#### Sample Response Payload (`GET /facilities`)
+
+```json
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "osm_way_1001",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [72.805, 21.25]
+      },
+      "properties": {
+        "facility_id": "osm_way_1001",
+        "name": "Hazira Petrochemical Refinery",
+        "category": "refinery",
+        "osm_type": "way",
+        "osm_id": 1001
+      }
+    }
+  ]
+}
+```
+
+---
+
+### Endpoint 4: `GET /hotspots`
+
+Retrieves active thermal hotspot events for a specified Indian region or custom spatial bounding box. Detections are aggregated by `event_id` so each `event_id` appears **once** in the response, with cluster-level pixel count, FRP total/max, first/last seen timestamps, bounding box, and the highest-severity pixel's model scores and signed SHAP attributions.
 
 #### Query Parameters
 
@@ -116,55 +225,92 @@ Retrieves all active thermal hotspots for a specified Indian region or custom sp
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `region` | `string` | Optional | `gujarat` | **Primary Interface**: Named Indian region key (`gujarat`, `maharashtra`, `odisha`, `chhattisgarh_jharkhand`, `all_india`). **Takes precedence over `bbox`**. | `maharashtra` |
 | `bbox` | `string` | Optional | Derived from region | Advanced manual override: `west,south,east,north` in degrees. Used only if `region` is omitted. | `72.5,21.0,73.5,22.0` |
-| `since_hours` | `integer` | Optional | `24` | Historical lookback window in hours. | `48` |
+| `since_hours` | `integer` | Optional | `24` | Historical lookback window in hours relative to dataset `data_as_of`. | `48` |
 
-#### Response Schema (Array of Hotspot Objects)
+#### Response Schema (Array of Aggregated Hotspot Objects)
 
 ```typescript
+interface ShapDriver {
+  feature: string;                     // Canonical feature name
+  direction: "+" | "-";                // "+" if pushing toward predicted class, "-" if pushing away
+  weight: number;                      // Normalized SHAP attribution magnitude (0.0 - 1.0)
+}
+
 interface HotspotResponse {
-  event_id: string;                      // Unique cluster ID (e.g. "evt_20260904_0032")
-  lat: number;                           // Hotspot latitude in degrees
-  lon: number;                           // Hotspot longitude in degrees
+  event_id: string;                    // Unique cluster ID (e.g. "evt_20260904_0032")
+  location_key: string;                // Facility OSM ID or H3 resolution-8 cell ID
+  lat: number;                         // Cluster centroid latitude in degrees
+  lon: number;                         // Cluster centroid longitude in degrees
+  bbox: [number, number, number, number]; // [west, south, east, north] of cluster pixels
+  pixel_count: number;                 // Number of satellite detections in this event cluster
+  first_seen: string;                  // Earliest detection timestamp in cluster (ISO-8601 UTC)
+  last_seen: string;                   // Latest detection timestamp in cluster (ISO-8601 UTC)
   observed: {
-    frp: number;                         // Fire Radiative Power in MW (raw sensor signal)
-    confidence: number;                  // Detection confidence percentage (0 - 100)
-    acq_date: string;                    // Acquisition date in "YYYY-MM-DD"
-    nearest_industrial_type: string;     // OSM facility category ("refinery", "power_plant", "waste_landfill", "quarry_mining", "solar_farm", "general_industrial", "none")
-    dist_to_industrial_m: number;        // Exact distance in meters to nearest facility boundary (0 = inside facility boundary)
+    frp: number;                       // Peak Fire Radiative Power in MW
+    frp_total: number;                 // Sum of Fire Radiative Power across cluster pixels in MW
+    frp_max: number;                   // Maximum pixel Fire Radiative Power in MW
+    brightness_ti4: number;            // Maximum I4 band brightness temperature in Kelvin
+    confidence: number;                // Detection confidence percentage (0 - 100)
+    acq_date: string;                  // Acquisition date in "YYYY-MM-DD"
+    acq_time: string;                  // Acquisition time in UTC ("HHMM")
+    daynight: "D" | "N";               // Day ("D") or Night ("N") satellite pass
+    satellite: string;                 // Satellite identifier (e.g. "SNPP", "N20")
+    land_cover: string;                // ESA WorldCover 10m land cover class
+    nearest_industrial_type: string;   // OSM facility category ("refinery", "power_plant", "waste_landfill", "quarry_mining", "solar_farm", "general_industrial", "none")
+    nearest_industrial_name: string | null; // OSM facility name tag if available
+    dist_to_industrial_m: number;      // Exact distance in meters to nearest facility boundary (0 = inside boundary)
   };
   inferred: {
-    event_type: string;                  // Predicted event class (see Event Types table below)
-    event_type_confidence: number;       // Classification probability (0.0 to 1.0)
-    anomaly_score_normalized: number;    // Robust statistical z-score deviation from facility baseline (0.0 to 1.0)
-    hazard_weight: number;               // Multiplier for event type severity (0.0 to 1.0)
-    exposure_factor: number;             // Human & infrastructure exposure risk (0.0 to 1.0)
-    final_risk_score: number;            // Combined score: hazard_weight * anomaly_score_normalized * exposure_factor (0.0 to 1.0)
-    escalating_24h: boolean;             // True if 24h risk is critical (risk_24h >= 0.50)
-    risk_24h: number;                    // 24h spread/intensification probability (0.0 to 1.0)
-    needs_manual_review: boolean;        // True if low confidence, accident, or candidate illegal unknown source
-    top_shap_features: string[];         // Top 3 feature drivers explaining the Model A prediction
+    event_type: string;                // Predicted event class (7 canonical classes)
+    event_type_confidence: number;     // Classification probability (0.0 to 1.0)
+    z_score: number;                   // Model B signed robust z-score in sigma units
+    is_anomalous: boolean;             // Model B boolean anomaly gate (|z| > 3 with >= 10 history samples)
+    anomaly_score_normalized: number;  // Robust statistical z-score deviation normalized to [0.0, 1.0]
+    hazard_weight: number;             // Multiplier for event type severity (0.0 to 1.0)
+    exposure_factor: number;           // Human & infrastructure exposure risk (0.0 to 1.0)
+    final_risk_score: number;          // Combined score: hazard_weight * anomaly_score_normalized * exposure_factor (0.0 to 1.0)
+    escalating_24h: boolean;           // True if 24h risk is critical (risk_24h >= 0.50)
+    risk_24h: number;                  // 24h spread/intensification probability (0.0 to 1.0)
+    needs_manual_review: boolean;      // True if low confidence, accident, or candidate illegal unknown source
+    top_shap_features: string[];       // Top feature driver names explaining the Model A prediction
+    top_shap_factors: ShapDriver[];    // Signed SHAP attributions per driver from TreeExplainer
   };
 }
 ```
 
-#### Sample Response Payload (`GET /hotspots?bbox=72.5,21.0,73.5,22.0&since_hours=24`)
+#### Sample Response Payload (`GET /hotspots?region=gujarat&since_hours=24`)
 
 ```json
 [
   {
     "event_id": "evt_20260904_0032",
+    "location_key": "osm_way_1001",
     "lat": 21.1700,
     "lon": 72.8300,
+    "bbox": [72.828, 21.168, 72.832, 21.172],
+    "pixel_count": 2,
+    "first_seen": "2026-09-04T01:30:00Z",
+    "last_seen": "2026-09-04T13:30:00Z",
     "observed": {
       "frp": 42.3,
+      "frp_total": 78.4,
+      "frp_max": 42.3,
+      "brightness_ti4": 365.2,
       "confidence": 87.0,
       "acq_date": "2026-09-04",
+      "acq_time": "1330",
+      "daynight": "N",
+      "satellite": "SNPP",
+      "land_cover": "built_up",
       "nearest_industrial_type": "refinery",
+      "nearest_industrial_name": "Hazira Petrochemical Refinery",
       "dist_to_industrial_m": 210.0
     },
     "inferred": {
       "event_type": "industrial_flare",
       "event_type_confidence": 0.91,
+      "z_score": 0.72,
+      "is_anomalous": false,
       "anomaly_score_normalized": 0.12,
       "hazard_weight": 0.1,
       "exposure_factor": 0.40,
@@ -176,34 +322,23 @@ interface HotspotResponse {
         "dist_to_nearest_industrial_m",
         "night_detection_fraction",
         "daynight"
-      ]
-    }
-  },
-  {
-    "event_id": "evt_20260904_0045",
-    "lat": 21.6500,
-    "lon": 73.1200,
-    "observed": {
-      "frp": 128.5,
-      "confidence": 96.0,
-      "acq_date": "2026-09-04",
-      "nearest_industrial_type": "none",
-      "dist_to_industrial_m": 4200.0
-    },
-    "inferred": {
-      "event_type": "wildfire",
-      "event_type_confidence": 0.89,
-      "anomaly_score_normalized": 0.75,
-      "hazard_weight": 1.0,
-      "exposure_factor": 0.65,
-      "final_risk_score": 0.488,
-      "escalating_24h": true,
-      "risk_24h": 0.72,
-      "needs_manual_review": true,
-      "top_shap_features": [
-        "land_cover_class",
-        "dist_to_nearest_industrial_m",
-        "wind_speed"
+      ],
+      "top_shap_factors": [
+        {
+          "feature": "dist_to_nearest_industrial_m",
+          "direction": "+",
+          "weight": 0.42
+        },
+        {
+          "feature": "night_detection_fraction",
+          "direction": "+",
+          "weight": 0.31
+        },
+        {
+          "feature": "daynight",
+          "direction": "+",
+          "weight": 0.18
+        }
       ]
     }
   }
@@ -212,9 +347,9 @@ interface HotspotResponse {
 
 ---
 
-### Endpoint 3: `GET /hotspot/{event_id}`
+### Endpoint 5: `GET /hotspot/{event_id}`
 
-Fetches the complete diagnostic profile, full 19-feature vector, and 7-class probability breakdown for a specific thermal event.
+Fetches the complete diagnostic profile, constituent 375 m VIIRS pixel footprints, full feature vector, and 7-class probability breakdown for a specific thermal event.
 
 #### Path Parameters
 
@@ -225,34 +360,18 @@ Fetches the complete diagnostic profile, full 19-feature vector, and 7-class pro
 #### Response Schema
 
 ```typescript
-interface HotspotDetailResponse {
-  event_id: string;
-  location_key: string;                  // Facility OSM ID or H3 resolution-8 cell ID
+interface HotspotPixel {
   lat: number;
   lon: number;
-  observed: ObservedData;                // (Same shape as in /hotspots)
-  inferred: InferredData;                // (Same shape as in /hotspots)
-  full_feature_vector: {
-    frp: number;
-    brightness_ti4: number;
-    brightness_ti5: number;
-    confidence: number;
-    daynight: "D" | "N";
-    dist_to_nearest_industrial_m: number;
-    nearest_industrial_type: string;
-    land_cover_class: string;
-    temperature: number;
-    humidity: number;
-    wind_speed: number;
-    days_active_last_30: number;
-    night_detection_fraction: number;
-    month: number;
-    is_agri_burn_season: 0 | 1;
-    frp_zscore_vs_facility_baseline: number;
-    dist_to_populated_area_m: number;
-    dist_to_critical_infra_m: number;
-    cluster_growth_rate: number;
-  };
+  frp: number;
+  brightness_ti4: number;
+  acq_date: string;
+  acq_time: string;
+}
+
+interface HotspotDetailResponse extends HotspotResponse {
+  pixels: HotspotPixel[];
+  full_feature_vector: Record<string, any>;
   class_probabilities: {
     industrial_flare: number;
     industrial_accident: number;
@@ -265,73 +384,9 @@ interface HotspotDetailResponse {
 }
 ```
 
-#### Sample Response Payload (`GET /hotspot/evt_20260904_0032`)
-
-```json
-{
-  "event_id": "evt_20260904_0032",
-  "location_key": "osm_way_1001",
-  "lat": 21.1700,
-  "lon": 72.8300,
-  "observed": {
-    "frp": 42.3,
-    "confidence": 87.0,
-    "acq_date": "2026-09-04",
-    "nearest_industrial_type": "refinery",
-    "dist_to_industrial_m": 210.0
-  },
-  "inferred": {
-    "event_type": "industrial_flare",
-    "event_type_confidence": 0.91,
-    "anomaly_score_normalized": 0.12,
-    "hazard_weight": 0.1,
-    "exposure_factor": 0.40,
-    "final_risk_score": 0.048,
-    "escalating_24h": false,
-    "risk_24h": 0.08,
-    "needs_manual_review": false,
-    "top_shap_features": [
-      "dist_to_nearest_industrial_m",
-      "night_detection_fraction",
-      "daynight"
-    ]
-  },
-  "full_feature_vector": {
-    "frp": 42.3,
-    "brightness_ti4": 365.2,
-    "brightness_ti5": 305.1,
-    "confidence": 87.0,
-    "daynight": "N",
-    "dist_to_nearest_industrial_m": 210.0,
-    "nearest_industrial_type": "refinery",
-    "land_cover_class": "built_up",
-    "temperature": 28.5,
-    "humidity": 68.0,
-    "wind_speed": 11.2,
-    "days_active_last_30": 26,
-    "night_detection_fraction": 0.58,
-    "month": 9,
-    "is_agri_burn_season": 0,
-    "frp_zscore_vs_facility_baseline": 0.72,
-    "dist_to_populated_area_m": 1200.0,
-    "dist_to_critical_infra_m": 350.0,
-    "cluster_growth_rate": 0.02
-  },
-  "class_probabilities": {
-    "industrial_flare": 0.91,
-    "industrial_accident": 0.03,
-    "stockpile_combustion": 0.01,
-    "known_false_positive": 0.00,
-    "wildfire": 0.01,
-    "agricultural_burn": 0.02,
-    "unknown_source": 0.02
-  }
-}
-```
-
 ---
 
-### Endpoint 4: `GET /facility/{location_key}/history`
+### Endpoint 6: `GET /facility/{location_key}/history`
 
 Returns the historical FRP time series along with robust Median + MAD statistical baseline bands for time-series chart rendering.
 
@@ -361,75 +416,9 @@ interface FacilityHistoryResponse {
 }
 ```
 
-#### Sample Response Payload (`GET /facility/osm_way_1001/history`)
-
-```json
-{
-  "location_key": "osm_way_1001",
-  "median_frp": 42.00,
-  "mad_frp": 5.50,
-  "upper_3sigma_threshold": 66.46,
-  "lower_3sigma_threshold": 17.54,
-  "sample_count": 28,
-  "history": [
-    {
-      "date": "2026-08-08",
-      "time": "0130",
-      "frp": 41.2,
-      "confidence": 85.0,
-      "daynight": "N"
-    },
-    {
-      "date": "2026-08-10",
-      "time": "1330",
-      "frp": 44.1,
-      "confidence": 90.0,
-      "daynight": "D"
-    },
-    {
-      "date": "2026-08-15",
-      "time": "0130",
-      "frp": 39.8,
-      "confidence": 88.0,
-      "daynight": "N"
-    },
-    {
-      "date": "2026-09-04",
-      "time": "0130",
-      "frp": 42.3,
-      "confidence": 87.0,
-      "daynight": "N"
-    }
-  ]
-}
-```
-
 ---
 
-## 3. UI Implementation & Mapping Guide
-
-### Map Marker Styling (Leaflet / Mapbox GL)
-
-1. **Marker Color** $\rightarrow$ mapped to `inferred.final_risk_score` (0.0 to 1.0):
-   - `0.00 - 0.15`: 🟢 Green (Routine flare, known false positive)
-   - `0.16 - 0.35`: 🟡 Yellow (Moderate risk / agricultural burn)
-   - `0.36 - 0.60`: 🟠 Orange (Stockpile combustion, growing fire)
-   - `0.61 - 1.00`: 🔴 Red (Severe wildfire, uncontained industrial accident)
-
-2. **Marker Badges / Flags**:
-   - `inferred.needs_manual_review == true`: Display ⚠️ **Review Required** badge.
-   - `inferred.escalating_24h == true`: Display 🔥 **Rapid Spread / Surge** badge.
-
-### Time-Series Baseline Chart (Recharts / Chart.js)
-
-When rendering `GET /facility/{location_key}/history`:
-- **X-Axis**: `date` + `time` formatted as timestamp.
-- **Y-Axis**: FRP in Megawatts (MW).
-- **Primary Line/Scatter**: Plot each point from `history[].frp` (colored by `daynight` flag: e.g. blue for `N`, amber for `D`).
-- **Median Reference Line**: Draw horizontal dashed line at `median_frp`.
-- **Upper Anomaly Threshold Band**: Draw horizontal red reference line or shaded upper band at `upper_3sigma_threshold`. Any FRP point crossing above this threshold is highlighted as an anomaly.
-
-### Reference: 7 Canonical Event Types
+## 3. Reference: 7 Canonical Event Types
 
 | Event Type String | UI Display Name | Default Hazard Weight | Typical Action / Routing |
 | :--- | :--- | :--- | :--- |
