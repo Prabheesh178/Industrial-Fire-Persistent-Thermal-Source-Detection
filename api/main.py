@@ -82,11 +82,10 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Enable CORS configured via CORS_ORIGINS env var
-_allow_origins = ["*"] if "*" in CORS_ORIGINS else CORS_ORIGINS
+# Enable universal CORS covering all Vercel domains, localhost, and custom frontend origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allow_origins,
+    allow_origin_regex=r".*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
