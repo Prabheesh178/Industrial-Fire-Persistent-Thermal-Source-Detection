@@ -24,7 +24,10 @@ STRICT RULES OBSERVED:
 
 import os
 import json
-import rasterio
+try:
+    import rasterio
+except ImportError:
+    rasterio = None
 import math
 import atexit
 import sys
@@ -143,6 +146,15 @@ def sample_landcover_for_hotspots(df_hotspots: pd.DataFrame) -> pd.Series:
     total_tiles = len(pending)
     if total_tiles:
         print(f"[LandCover] Sampling {sum(len(v) for v in pending.values())} points across {total_tiles} ESA WorldCover 10m S3 tiles...")
+
+    if rasterio is None:
+        print("[LandCover] rasterio not available; assigning landcover from cache or default.")
+        for sub in pending.values():
+            for idx, _la, _lo, ck in sub:
+                res = _LANDCOVER_CACHE.get(ck, "cropland")
+                out[idx] = res
+                _LANDCOVER_CACHE[ck] = res
+        return out
 
     for tile_idx, (url, items) in enumerate(pending.items(), start=1):
         tile_name = url.rsplit("/", 1)[-1]
