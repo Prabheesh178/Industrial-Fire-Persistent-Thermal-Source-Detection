@@ -37,6 +37,9 @@ logger = logging.getLogger("firms_refresh")
 REFRESH_ENABLED: bool = os.getenv("REFRESH_ENABLED", "false").lower() in ("true", "1", "yes")
 REFRESH_MINUTES: int = int(os.getenv("REFRESH_MINUTES", "30"))
 REFRESH_RETAIN_DAYS: int = int(os.getenv("REFRESH_RETAIN_DAYS", "30"))
+KEEP_ALIVE_URL: Optional[str] = os.getenv("KEEP_ALIVE_URL")
+KEEP_ALIVE_MINUTES: int = int(os.getenv("KEEP_ALIVE_MINUTES", "10"))
+
 
 _REFRESH_STATE: Dict[str, Any] = {
     "enabled": REFRESH_ENABLED,
@@ -218,11 +221,54 @@ class FirmsRefreshDaemon(threading.Thread):
         self.stop_event.set()
 
 
+class KeepAliveDaemon(threading.Thread):
+    """
+    Self-ping background thread that pings the Render service every 10 minutes
+    (before Render's 15-minute inactivity timeout) to keep it awake on the free tier.
+    """
+
+    def __init__(self, target_url: str, interval_minutes: int = KEEP_ALIVE_MINUTES):
+        super().__init__(daemon=True, name="KeepAliveDaemon")
+        clean_url = target_url.strip().rstrip("/")
+        if not clean_url.endswith("/health"):
+            clean_url = f"{clean_url}/health"
+        self.target_url = clean_url
+        self.interval_seconds = max(60, interval_minutes * 60)
+        self.stop_event = threading.Event()
+
+    def run(self):
+        import requests
+        logger.info(f"[KeepAlive] Started pinging {self.target_url} every {self.interval_seconds // 60}m.")
+        # Initial wait before starting pings
+        self.stop_event.wait(60)
+
+        while not self.stop_event.is_set():
+            try:
+                resp = requests.get(self.target_url, timeout=15)
+                logger.info(f"[KeepAlive] Ping {self.target_url} -> HTTP {resp.status_code}")
+            except Exception as exc:
+                logger.warning(f"[KeepAlive] Ping to {self.target_url} failed: {exc}")
+
+            self.stop_event.wait(self.interval_seconds)
+
+    def stop(self):
+        self.stop_event.set()
+
+
 _DAEMON_INSTANCE: Optional[FirmsRefreshDaemon] = None
+_KEEP_ALIVE_INSTANCE: Optional[KeepAliveDaemon] = None
 
 
 def start_refresh_daemon_if_enabled():
-    global _DAEMON_INSTANCE
+    global _DAEMON_INSTANCE, _KEEP_ALIVE_INSTANCE
+
+    # Launch KeepAlive daemon if KEEP_ALIVE_URL is provided (e.g. your onrender.com URL)
+    render_external_url = KEEP_ALIVE_URL or os.getenv("RENDER_EXTERNAL_URL")
+    if render_external_url and (_KEEP_ALIVE_INSTANCE is None or not _KEEP_ALIVE_INSTANCE.is_alive()):
+        _KEEP_ALIVE_INSTANCE = KeepAliveDaemon(render_external_url, KEEP_ALIVE_MINUTES)
+        _KEEP_ALIVE_INSTANCE.start()
+        logger.info(f"[KeepAlive] Spawned keep-alive daemon for {render_external_url} (interval: {KEEP_ALIVE_MINUTES} min).")
+
     if not REFRESH_ENABLED:
         logger.info("[Refresh Worker] Live refresh is disabled (REFRESH_ENABLED=false). Operating in snapshot mode.")
         return None
@@ -232,4 +278,5 @@ def start_refresh_daemon_if_enabled():
         _DAEMON_INSTANCE.start()
         logger.info(f"[Refresh Worker] Daemon spawned successfully (interval: {REFRESH_MINUTES} min).")
     return _DAEMON_INSTANCE
+
 
