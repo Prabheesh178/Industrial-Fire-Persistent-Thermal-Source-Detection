@@ -133,28 +133,16 @@ Thumbs.db
     with open(dest_dir / ".gitignore", "w", encoding="utf-8") as f:
         f.write(deploy_gitignore)
 
-    # Add deploy README
-    deploy_readme = """# Thermal Watch API Service (Render Deploy)
-
-Production serving repository for the **Industrial Fire & Persistent Thermal Source Detection API**.
-Designed for deployment on Render's free web service tier.
-
-## Endpoints
-- `GET /health`: Health status, data mode (`snapshot` or `live`), data currency timestamp, and artifact metadata.
-- `GET /regions`: Supported Indian industrial regions.
-- `GET /facilities`: GeoJSON of industrial facilities from cached extract.
-- `GET /hotspots?region=gujarat&since_hours=168`: Scored, aggregated thermal events with SHAP attributions.
-- `GET /hotspot/{event_id}`: Full feature vector and constituent pixels for an event.
-- `GET /facility/{location_key}/history`: Historical FRP time-series with MAD baseline band.
-
-## Run Locally
-```bash
-pip install -r requirements-serve.txt
-uvicorn api.main:app --host 0.0.0.0 --port 8000
-```
+    # Copy deploy README from tools/DEPLOY_README.md if present, else fallback
+    deploy_readme_src = REPO_ROOT / "tools" / "DEPLOY_README.md"
+    if deploy_readme_src.exists():
+        shutil.copy2(deploy_readme_src, dest_dir / "README.md")
+    else:
+        deploy_readme = """# Thermal Watch API Service (Render Deploy)
+...
 """
-    with open(dest_dir / "README.md", "w", encoding="utf-8") as f:
-        f.write(deploy_readme)
+        with open(dest_dir / "README.md", "w", encoding="utf-8") as f:
+            f.write(deploy_readme)
 
     print(f"\n[Export] Complete. Total files: {len(copied_files) + 2}, Total size: {round(total_bytes / (1024*1024), 2)} MB")
     return copied_files, total_bytes
