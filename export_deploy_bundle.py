@@ -83,9 +83,19 @@ DEPLOY_ALLOWLIST = [
 
 def export_bundle(dest_dir: Path = DEPLOY_DIR):
     print(f"[Export] Rebuilding deploy bundle at: {dest_dir}")
-    if dest_dir.exists():
-        shutil.rmtree(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
+    # Clear existing content but preserve .git directory if present
+    for item in dest_dir.iterdir():
+        if item.name == ".git":
+            continue
+        if item.is_dir():
+            shutil.rmtree(item, ignore_errors=True)
+        else:
+            try:
+                item.unlink()
+            except Exception:
+                pass
+
 
     copied_files = []
     total_bytes = 0
