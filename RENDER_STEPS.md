@@ -114,3 +114,4 @@ Under the **Environment** tab of your Render service, add the following variable
 | **Render Web Service Out of Memory (OOM)** | Free tier 512 MB exceeded due to uncompressed OSM cache or long lookback. | `facilities_slim.json` is committed (`5.4 MB`), keeping peak RAM around ~258 MB. Ensure `REFRESH_RETAIN_DAYS` is set to `30`. |
 | **Cold-start delay (~50 seconds)** | Render free tier spins down web services after 15 minutes of inactivity. | The dashboard displays an amber `WAKING THE API...` badge and waits up to 60 seconds before falling back to demo data. |
 | **`refresh_status: failed: FIRMS_MAP_KEY missing`** | Key was not set under Render Environment tab. | Enter your 32-character key under `FIRMS_MAP_KEY` in Render dashboard and save. |
+

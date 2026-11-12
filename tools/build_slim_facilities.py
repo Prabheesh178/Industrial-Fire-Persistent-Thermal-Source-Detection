@@ -82,3 +82,4 @@ def build_slim_facilities(source_path: Path = Path(OSM_CACHE_PATH), dest_path: P
 
 if __name__ == "__main__":
     build_slim_facilities()
+

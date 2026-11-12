@@ -232,3 +232,4 @@ def start_refresh_daemon_if_enabled():
         _DAEMON_INSTANCE.start()
         logger.info(f"[Refresh Worker] Daemon spawned successfully (interval: {REFRESH_MINUTES} min).")
     return _DAEMON_INSTANCE
+
