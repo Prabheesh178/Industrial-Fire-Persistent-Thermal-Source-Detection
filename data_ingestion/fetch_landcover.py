@@ -140,7 +140,12 @@ def sample_landcover_for_hotspots(df_hotspots: pd.DataFrame) -> pd.Series:
         else:
             pending.setdefault(_esa_tile_url(la, lo), []).append((i, la, lo, ck))
 
-    for url, items in pending.items():
+    total_tiles = len(pending)
+    if total_tiles:
+        print(f"[LandCover] Sampling {sum(len(v) for v in pending.values())} points across {total_tiles} ESA WorldCover 10m S3 tiles...")
+
+    for tile_idx, (url, items) in enumerate(pending.items(), start=1):
+        tile_name = url.rsplit("/", 1)[-1]
         try:
             with rasterio.open(f"/vsicurl/{url}") as ds:
                 coords = [(lo, la) for _, la, lo, _ in items]
@@ -148,9 +153,11 @@ def sample_landcover_for_hotspots(df_hotspots: pd.DataFrame) -> pd.Series:
                     res = ESA_WORLDCOVER_MAP.get(int(val[0]), "barren")
                     out[idx] = res
                     _LANDCOVER_CACHE[ck] = res
+            print(f"  [LandCover] Tile {tile_idx}/{total_tiles} ({tile_name}): sampled {len(items)} points", flush=True)
+            save_landcover_cache()
         except Exception as exc:
             # A missing ocean tile is normal; anything else is worth seeing.
-            print(f"[LandCover] tile unavailable ({url.rsplit('/', 1)[-1]}): "
+            print(f"[LandCover] tile unavailable ({tile_name}): "
                   f"{type(exc).__name__}. Marking {len(items)} points 'unknown'.")
             for idx, _la, _lo, ck in items:
                 out[idx] = "unknown"

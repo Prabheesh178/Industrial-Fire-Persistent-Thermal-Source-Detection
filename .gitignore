@@ -43,6 +43,7 @@ data/
 artifacts/*
 !artifacts/.gitkeep
 
-# OS generated
+# OS & IDE generated
 .DS_Store
 Thumbs.db
+.vscode/

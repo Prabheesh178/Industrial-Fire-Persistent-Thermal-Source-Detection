@@ -102,9 +102,12 @@ score_combiner = ScoreCombiner()
 _SCORED_CACHE: Dict[str, Dict[str, Any]] = {}
 _FACILITY_NAME_CACHE: Dict[str, str] = {}
 _FACILITIES_GEOJSON_CACHE: Optional[Dict[str, Any]] = None
+_SNAPSHOT_DF_CACHE: Optional[pd.DataFrame] = None
+_SNAPSHOT_MTIME: Optional[float] = None
 
 FEATURE_TABLE_PATH = Path(DATA_DIR) / "feature_table.csv"
 LABELED_DATASET_PATH = Path(DATA_DIR) / "labeled_dataset.csv"
+SLIM_FACILITIES_PATH = Path(DATA_DIR) / "facilities_slim.json"
 
 
 def _classify_osm_element(tags: Dict[str, Any]) -> Optional[str]:
@@ -167,7 +170,8 @@ def _extract_element_coords(el: Dict[str, Any]) -> Optional[Tuple[float, float]]
 
 def _load_osm_facilities() -> Tuple[Dict[str, str], Dict[str, Any]]:
     """
-    Parses data/osm_cache.json into a facility_id -> name map and a GeoJSON FeatureCollection.
+    Parses cached facility extract into a facility_id -> name map and a GeoJSON FeatureCollection.
+    Prioritizes data/facilities_slim.json (~5 MB) for low RAM footprint, falling back to data/osm_cache.json.
     """
     global _FACILITY_NAME_CACHE, _FACILITIES_GEOJSON_CACHE
     if _FACILITIES_GEOJSON_CACHE is not None:
@@ -176,6 +180,18 @@ def _load_osm_facilities() -> Tuple[Dict[str, str], Dict[str, Any]]:
     names: Dict[str, str] = {}
     features: List[Dict[str, Any]] = []
 
+    # 1. Prefer slim runtime facilities file
+    if SLIM_FACILITIES_PATH.exists():
+        try:
+            with open(SLIM_FACILITIES_PATH, "r", encoding="utf-8") as f:
+                slim_data = json.load(f)
+            _FACILITY_NAME_CACHE = slim_data.get("names", {})
+            _FACILITIES_GEOJSON_CACHE = slim_data.get("facilities", {"type": "FeatureCollection", "features": []})
+            return _FACILITY_NAME_CACHE, _FACILITIES_GEOJSON_CACHE
+        except Exception as e:
+            print(f"[API] Warning: Failed to parse slim facilities cache ({e}). Falling back...")
+
+    # 2. Fall back to raw OSM cache if slim file is missing
     if Path(OSM_CACHE_PATH).exists():
         try:
             with open(OSM_CACHE_PATH, "r", encoding="utf-8") as f:
@@ -313,6 +329,33 @@ def _get_dataset_summary() -> Tuple[Optional[str], int]:
     Determines max acquisition timestamp (data_as_of) and distinct event count from
     cached snapshot or SQLite persistence log.
     """
+    if _SNAPSHOT_DF_CACHE is not None and not _SNAPSHOT_DF_CACHE.empty:
+        data_as_of = str(_SNAPSHOT_DF_CACHE["_iso_ts"].max()) if "_iso_ts" in _SNAPSHOT_DF_CACHE.columns else None
+        n_events = (
+            int(_SNAPSHOT_DF_CACHE["event_id"].nunique())
+            if "event_id" in _SNAPSHOT_DF_CACHE.columns
+            else len(_SNAPSHOT_DF_CACHE)
+        )
+        return data_as_of, n_events
+
+    for csv_path in (FEATURE_TABLE_PATH, LABELED_DATASET_PATH):
+        if csv_path.exists():
+            try:
+                df = pd.read_csv(csv_path, usecols=lambda c: c in {"event_id", "acq_date", "acq_time"})
+                if not df.empty:
+                    iso_times = [
+                        _format_iso_utc(d, t)
+                        for d, t in zip(
+                            df["acq_date"],
+                            df["acq_time"] if "acq_time" in df.columns else ["0000"] * len(df),
+                        )
+                    ]
+                    data_as_of = max(iso_times) if iso_times else None
+                    n_events = int(df["event_id"].nunique()) if "event_id" in df.columns else len(df)
+                    return data_as_of, n_events
+            except Exception:
+                pass
+
     if _SCORED_CACHE:
         last_seen_vals = [
             v["response"].last_seen
@@ -321,21 +364,6 @@ def _get_dataset_summary() -> Tuple[Optional[str], int]:
         ]
         data_as_of = max(last_seen_vals) if last_seen_vals else None
         return data_as_of, len(_SCORED_CACHE)
-
-    for csv_path in (FEATURE_TABLE_PATH, LABELED_DATASET_PATH):
-        if csv_path.exists():
-            try:
-                df = pd.read_csv(csv_path, usecols=lambda c: c in {"event_id", "acq_date", "acq_time"})
-                if not df.empty:
-                    iso_times = [
-                        _format_iso_utc(r.get("acq_date"), r.get("acq_time"))
-                        for _, r in df.iterrows()
-                    ]
-                    data_as_of = max(iso_times) if iso_times else None
-                    n_events = int(df["event_id"].nunique()) if "event_id" in df.columns else len(df)
-                    return data_as_of, n_events
-            except Exception:
-                pass
 
     if Path(DB_PATH).exists():
         try:
@@ -361,7 +389,7 @@ def _compute_signed_shap_factors(feature_row: pd.Series, event_type: str, top_n:
         return []
 
     try:
-        df_single = pd.DataFrame([feature_row])
+        df_single = pd.DataFrame([feature_row]).reset_index(drop=True)
         X = model_a._preprocess_features(df_single)
         if event_type in model_a.label_encoder.classes_:
             class_idx = int(model_a.label_encoder.transform([event_type])[0])
@@ -409,6 +437,7 @@ def _load_or_build_feature_dataframe(
     or lazily runs the ingestion & spatial pipeline if live polling is requested or no snapshot exists.
     Filters rows by bounding box [w, s, e, n] and since_hours relative to max timestamp in the data.
     """
+    global _SNAPSHOT_DF_CACHE, _SNAPSHOT_MTIME
     live_poll = os.getenv("LIVE_FIRMS_POLL", "false").lower() == "true"
     df_features: Optional[pd.DataFrame] = None
 
@@ -416,43 +445,46 @@ def _load_or_build_feature_dataframe(
         for candidate in (FEATURE_TABLE_PATH, LABELED_DATASET_PATH):
             if candidate.exists():
                 try:
+                    mtime = candidate.stat().st_mtime
+                    if _SNAPSHOT_DF_CACHE is not None and _SNAPSHOT_MTIME == mtime:
+                        df_features = _SNAPSHOT_DF_CACHE
+                        break
                     df_loaded = pd.read_csv(candidate)
                     if not df_loaded.empty and "latitude" in df_loaded.columns and "longitude" in df_loaded.columns:
+                        if "acq_date" in df_loaded.columns:
+                            iso_list = [
+                                _format_iso_utc(d, t)
+                                for d, t in zip(
+                                    df_loaded["acq_date"],
+                                    df_loaded["acq_time"] if "acq_time" in df_loaded.columns else ["0000"] * len(df_loaded),
+                                )
+                            ]
+                            df_loaded["_iso_ts"] = iso_list
+                            df_loaded["_ts_dt"] = pd.to_datetime(iso_list, utc=True, errors="coerce")
+                        _SNAPSHOT_DF_CACHE = df_loaded
+                        _SNAPSHOT_MTIME = mtime
                         df_features = df_loaded
                         break
                 except Exception as exc:
                     print(f"[API] Warning: Could not read {candidate}: {exc}")
 
     if df_features is not None:
+        # Filter relative to global max timestamp in dataset if since_hours is specified
+        df_sub = df_features
+        if since_hours > 0 and "_ts_dt" in df_sub.columns:
+            max_ts = df_features["_ts_dt"].max()
+            if pd.notna(max_ts):
+                cutoff = max_ts - pd.Timedelta(hours=since_hours)
+                df_sub = df_sub[df_sub["_ts_dt"] >= cutoff]
+
         # Filter by bounding box
         mask_bbox = (
-            (df_features["longitude"] >= w)
-            & (df_features["longitude"] <= e)
-            & (df_features["latitude"] >= s)
-            & (df_features["latitude"] <= n)
+            (df_sub["longitude"] >= w)
+            & (df_sub["longitude"] <= e)
+            & (df_sub["latitude"] >= s)
+            & (df_sub["latitude"] <= n)
         )
-        df_sub = df_features[mask_bbox].copy()
-        if df_sub.empty:
-            return df_sub
-
-        # Filter relative to max timestamp in dataset if since_hours is specified
-        if since_hours > 0 and "acq_date" in df_sub.columns:
-            try:
-                iso_series = pd.to_datetime(
-                    [
-                        _format_iso_utc(r.get("acq_date"), r.get("acq_time", "0000"))
-                        for _, r in df_sub.iterrows()
-                    ],
-                    utc=True,
-                    errors="coerce",
-                )
-                max_ts = iso_series.max()
-                if pd.notna(max_ts):
-                    cutoff = max_ts - pd.Timedelta(hours=since_hours)
-                    df_sub = df_sub[iso_series >= cutoff].copy()
-            except Exception:
-                pass
-        return df_sub
+        return df_sub[mask_bbox].copy()
 
     # Lazy import heavy geospatial modules only when running live ingestion pipeline
     from data_ingestion.fetch_firms import fetch_firms_hotspots
@@ -470,6 +502,48 @@ def _load_or_build_feature_dataframe(
     df_clustered = cluster_hotspots_spatiotemporal(df_joined)
     df_persisted = update_persistence_log(df_clustered, str(DB_PATH))
     return build_feature_table(df_persisted, anomaly_engine=model_b)
+
+
+def _extract_shap_from_matrix(
+    shap_values: Any, sample_idx: int, class_idx: int, top_n: int = 5
+) -> Tuple[List[str], List[ShapDriver]]:
+    """
+    Extracts top feature names and signed ShapDriver objects for row `sample_idx` and `class_idx`
+    from a batch TreeExplainer output.
+    """
+    try:
+        if isinstance(shap_values, list):
+            signed_vals = np.asarray(shap_values[class_idx][sample_idx], dtype=float)
+        elif hasattr(shap_values, "shape") and len(shap_values.shape) == 3:
+            signed_vals = np.asarray(shap_values[sample_idx, :, class_idx], dtype=float)
+        else:
+            signed_vals = np.asarray(shap_values[sample_idx], dtype=float)
+
+        abs_vals = np.abs(signed_vals)
+        total_abs = float(np.sum(abs_vals))
+        feature_names = model_a.feature_names
+        top_indices = np.argsort(abs_vals)[::-1]
+        top_names = [str(feature_names[i]) for i in top_indices[:3]]
+
+        if total_abs <= 1e-12:
+            return top_names, []
+
+        drivers: List[ShapDriver] = []
+        for idx in top_indices[:top_n]:
+            weight = round(float(abs_vals[idx] / total_abs), 3)
+            if weight <= 0:
+                continue
+            direction = "+" if float(signed_vals[idx]) >= 0.0 else "-"
+            drivers.append(
+                ShapDriver(
+                    feature=str(feature_names[idx]),
+                    direction=direction,
+                    weight=weight,
+                )
+            )
+        return top_names, drivers
+    except Exception:
+        return ["dist_to_nearest_industrial_m", "night_detection_fraction", "daynight"], []
 
 
 def _score_and_aggregate_events(df_features: pd.DataFrame) -> List[HotspotResponse]:
@@ -490,197 +564,262 @@ def _score_and_aggregate_events(df_features: pd.DataFrame) -> List[HotspotRespon
         df_features["event_id"] = [f"evt_{i:04d}" for i in range(len(df_features))]
 
     results: List[HotspotResponse] = []
+    uncached_groups: List[Tuple[str, pd.DataFrame]] = []
 
     for event_id_raw, group in df_features.groupby("event_id", sort=False):
         event_id = str(event_id_raw)
-        pixels_list: List[HotspotPixel] = []
-        scored_candidates: List[Dict[str, Any]] = []
+        cached = _SCORED_CACHE.get(event_id)
+        if cached is not None and cached["response"].pixel_count == len(group):
+            results.append(cached["response"])
+        else:
+            uncached_groups.append((event_id, group))
 
-        for _, row in group.iterrows():
-            lat = float(row["latitude"])
-            lon = float(row["longitude"])
-            frp = float(row.get("frp", 0.0))
-            ti4 = float(row.get("bright_ti4", row.get("brightness_ti4", 320.0)))
-            conf = float(row.get("confidence", 80.0))
-            acq_date = str(row.get("acq_date", "2026-09-04"))
-            acq_time = str(row.get("acq_time", "0000")).split(".")[0].zfill(4)
-            iso_ts = _format_iso_utc(acq_date, acq_time)
-            ind_type = str(row.get("nearest_industrial_type", "none"))
-            dist_ind = float(row.get("dist_to_nearest_industrial_m", 5000.0))
-            loc_key = str(row.get("location_key", f"h3_{round(lat, 3)}_{round(lon, 3)}"))
+    if uncached_groups:
+        df_uncached = pd.concat([g for _, g in uncached_groups], axis=0).reset_index(drop=True)
+        X_a_all = model_a._preprocess_features(df_uncached)
+        probs_a_all = model_a.model.predict_proba(X_a_all)
+        classes_a = list(model_a.label_encoder.classes_)
 
-            pixels_list.append(
-                HotspotPixel(
-                    lat=round(lat, 5),
-                    lon=round(lon, 5),
-                    frp=round(frp, 2),
-                    brightness_ti4=round(ti4, 1),
-                    acq_date=acq_date,
-                    acq_time=acq_time,
+        X_c_all = model_c._preprocess_features(df_uncached)
+        probs_c_all = model_c.model.predict_proba(X_c_all)[:, 1]
+
+        pending_events: List[Dict[str, Any]] = []
+        row_offset = 0
+
+        for event_id, group in uncached_groups:
+            n_rows = len(group)
+            pixels_list: List[HotspotPixel] = []
+            scored_candidates: List[Dict[str, Any]] = []
+
+            for local_i, (_, row) in enumerate(group.iterrows()):
+                global_i = row_offset + local_i
+                lat = float(row["latitude"])
+                lon = float(row["longitude"])
+                frp = float(row.get("frp", 0.0))
+                ti4 = float(row.get("bright_ti4", row.get("brightness_ti4", 320.0)))
+                conf = float(row.get("confidence", 80.0))
+                acq_date = str(row.get("acq_date", "2026-09-04"))
+                acq_time = str(row.get("acq_time", "0000")).split(".")[0].zfill(4)
+                iso_ts = str(row.get("_iso_ts") or _format_iso_utc(acq_date, acq_time))
+                ind_type = str(row.get("nearest_industrial_type", "none"))
+                dist_ind = float(row.get("dist_to_nearest_industrial_m", 5000.0))
+                loc_key = str(row.get("location_key", f"h3_{round(lat, 3)}_{round(lon, 3)}"))
+
+                pixels_list.append(
+                    HotspotPixel(
+                        lat=round(lat, 5),
+                        lon=round(lon, 5),
+                        frp=round(frp, 2),
+                        brightness_ti4=round(ti4, 1),
+                        acq_date=acq_date,
+                        acq_time=acq_time,
+                    )
                 )
+
+                # Model A inference from vectorized batch
+                probs_row = probs_a_all[global_i]
+                top_idx = int(np.argmax(probs_row))
+                pred_class = str(classes_a[top_idx])
+                confidence_a = float(probs_row[top_idx])
+                pred_a = {
+                    "event_type": pred_class,
+                    "event_type_confidence": round(confidence_a, 3),
+                    "probabilities": {cls: round(float(p), 3) for cls, p in zip(classes_a, probs_row)},
+                    "top_shap_features": [],
+                    "_class_idx": top_idx,
+                }
+
+                # Model B anomaly inference
+                z_score, is_anom = model_b.compute_z_score(loc_key, frp, ind_type)
+                anomaly_norm = model_b.compute_anomaly_score_normalized(z_score)
+                pred_b = {
+                    "anomaly_score_normalized": anomaly_norm,
+                    "z_score": z_score,
+                    "is_anomalous": is_anom,
+                }
+
+                # Model C 24h risk inference from vectorized batch
+                risk_prob = float(probs_c_all[global_i])
+                pred_c = {
+                    "risk_24h": round(risk_prob, 3),
+                    "escalating_24h": bool(risk_prob >= 0.50),
+                }
+
+                # Score Combiner
+                dist_pop = float(row.get("dist_to_populated_area_m", 5000.0))
+                dist_infra = float(row.get("dist_to_critical_infra_m", 5000.0))
+                inferred = score_combiner.combine(
+                    model_a_output=pred_a,
+                    model_b_output=pred_b,
+                    model_c_output=pred_c,
+                    dist_to_populated_m=dist_pop,
+                    dist_to_infra_m=dist_infra,
+                )
+
+                scored_candidates.append(
+                    {
+                        "row": row,
+                        "lat": lat,
+                        "lon": lon,
+                        "frp": frp,
+                        "ti4": ti4,
+                        "conf": conf,
+                        "acq_date": acq_date,
+                        "acq_time": acq_time,
+                        "iso_ts": iso_ts,
+                        "ind_type": ind_type,
+                        "dist_ind": dist_ind,
+                        "loc_key": loc_key,
+                        "pred_a": pred_a,
+                        "pred_b": pred_b,
+                        "pred_c": pred_c,
+                        "inferred": inferred,
+                    }
+                )
+
+            row_offset += n_rows
+            best = max(
+                scored_candidates,
+                key=lambda c: (float(c["inferred"]["final_risk_score"]), float(c["frp"])),
             )
-
-            # Model A inference
-            pred_a = model_a.predict_point(row)
-
-            # Model B anomaly inference
-            z_score, is_anom = model_b.compute_z_score(loc_key, frp, ind_type)
-            anomaly_norm = model_b.compute_anomaly_score_normalized(z_score)
-            pred_b = {
-                "anomaly_score_normalized": anomaly_norm,
-                "z_score": z_score,
-                "is_anomalous": is_anom,
-            }
-
-            # Model C 24h risk inference
-            pred_c = model_c.predict_point(row)
-
-            # Score Combiner
-            dist_pop = float(row.get("dist_to_populated_area_m", 5000.0))
-            dist_infra = float(row.get("dist_to_critical_infra_m", 5000.0))
-            inferred = score_combiner.combine(
-                model_a_output=pred_a,
-                model_b_output=pred_b,
-                model_c_output=pred_c,
-                dist_to_populated_m=dist_pop,
-                dist_to_infra_m=dist_infra,
-            )
-
-            scored_candidates.append(
+            pending_events.append(
                 {
-                    "row": row,
-                    "lat": lat,
-                    "lon": lon,
-                    "frp": frp,
-                    "ti4": ti4,
-                    "conf": conf,
-                    "acq_date": acq_date,
-                    "acq_time": acq_time,
-                    "iso_ts": iso_ts,
-                    "ind_type": ind_type,
-                    "dist_ind": dist_ind,
-                    "loc_key": loc_key,
-                    "pred_a": pred_a,
-                    "pred_b": pred_b,
-                    "pred_c": pred_c,
-                    "inferred": inferred,
+                    "event_id": event_id,
+                    "pixels_list": pixels_list,
+                    "scored_candidates": scored_candidates,
+                    "best": best,
                 }
             )
 
-        # Select the highest-severity pixel in the event cluster (highest final_risk_score, tie-broken by FRP)
-        best = max(
-            scored_candidates,
-            key=lambda c: (float(c["inferred"]["final_risk_score"]), float(c["frp"])),
-        )
-        rep_row: pd.Series = best["row"]
-        rep_inferred = best["inferred"]
-        rep_pred_a = best["pred_a"]
-        rep_pred_b = best["pred_b"]
+        # Vectorized TreeExplainer SHAP computation across representative event rows
+        df_rep = pd.DataFrame([pe["best"]["row"] for pe in pending_events]).reset_index(drop=True)
+        X_rep = model_a._preprocess_features(df_rep)
+        try:
+            shap_batch = model_a.explainer.shap_values(X_rep) if model_a.explainer is not None else None
+        except Exception:
+            shap_batch = None
 
-        # Aggregate cluster-level geometry & radiometry
-        all_lats = [c["lat"] for c in scored_candidates]
-        all_lons = [c["lon"] for c in scored_candidates]
-        all_frps = [c["frp"] for c in scored_candidates]
-        all_ti4s = [c["ti4"] for c in scored_candidates]
-        all_confs = [c["conf"] for c in scored_candidates]
-        all_ts = [c["iso_ts"] for c in scored_candidates]
+        for pe_idx, pe in enumerate(pending_events):
+            event_id = pe["event_id"]
+            pixels_list = pe["pixels_list"]
+            scored_candidates = pe["scored_candidates"]
+            best = pe["best"]
+            rep_row: pd.Series = best["row"]
+            rep_inferred = best["inferred"]
+            rep_pred_a = best["pred_a"]
+            rep_pred_b = best["pred_b"]
 
-        min_lon, max_lon = min(all_lons), max(all_lons)
-        min_lat, max_lat = min(all_lats), max(all_lats)
-        if abs(max_lon - min_lon) < 0.002:
-            min_lon -= 0.001
-            max_lon += 0.001
-        if abs(max_lat - min_lat) < 0.002:
-            min_lat -= 0.001
-            max_lat += 0.001
-
-        frp_total = round(float(sum(all_frps)), 1)
-        frp_max = round(float(max(all_frps)), 1)
-        ti4_max = round(float(max(all_ti4s)), 1)
-        conf_max = round(float(max(all_confs)), 1)
-        first_seen = min(all_ts)
-        last_seen = max(all_ts)
-
-        fac_id = str(rep_row.get("facility_id", best["loc_key"]))
-        fac_name = facility_names.get(fac_id) or facility_names.get(best["loc_key"])
-
-        shap_drivers = _compute_signed_shap_factors(rep_row, rep_inferred["event_type"], top_n=5)
-
-        observed_obj = ObservedData(
-            frp=frp_max,
-            frp_total=frp_total,
-            frp_max=frp_max,
-            brightness_ti4=ti4_max,
-            confidence=conf_max,
-            acq_date=best["acq_date"],
-            acq_time=best["acq_time"],
-            daynight=str(rep_row.get("daynight", "D")),
-            satellite=str(rep_row.get("satellite", "SNPP")),
-            land_cover=str(rep_row.get("land_cover", "unknown")),
-            nearest_industrial_type=best["ind_type"],
-            nearest_industrial_name=fac_name,
-            dist_to_industrial_m=round(best["dist_ind"], 1),
-        )
-
-        inferred_obj = InferredData(
-            event_type=rep_inferred["event_type"],
-            event_type_confidence=rep_inferred["event_type_confidence"],
-            z_score=round(float(rep_pred_b["z_score"]), 2),
-            is_anomalous=bool(rep_pred_b["is_anomalous"]),
-            anomaly_score_normalized=rep_inferred["anomaly_score_normalized"],
-            hazard_weight=rep_inferred["hazard_weight"],
-            exposure_factor=rep_inferred["exposure_factor"],
-            final_risk_score=rep_inferred["final_risk_score"],
-            escalating_24h=rep_inferred["escalating_24h"],
-            risk_24h=rep_inferred["risk_24h"],
-            needs_manual_review=rep_inferred["needs_manual_review"],
-            top_shap_features=rep_inferred["top_shap_features"],
-            top_shap_factors=shap_drivers,
-        )
-
-        centroid_lat = round(float(np.mean(all_lats)), 4)
-        centroid_lon = round(float(np.mean(all_lons)), 4)
-
-        item = HotspotResponse(
-            event_id=event_id,
-            location_key=best["loc_key"],
-            lat=centroid_lat,
-            lon=centroid_lon,
-            bbox=[
-                round(min_lon, 5),
-                round(min_lat, 5),
-                round(max_lon, 5),
-                round(max_lat, 5),
-            ],
-            pixel_count=len(scored_candidates),
-            first_seen=first_seen,
-            last_seen=last_seen,
-            observed=observed_obj,
-            inferred=inferred_obj,
-        )
-        results.append(item)
-
-        # Clean feature vector dictionary for JSON serialization
-        clean_fv: Dict[str, Any] = {}
-        for k, v in rep_row.to_dict().items():
-            if pd.isna(v):
-                clean_fv[str(k)] = None
-            elif isinstance(v, (np.integer, int)):
-                clean_fv[str(k)] = int(v)
-            elif isinstance(v, (np.floating, float)):
-                clean_fv[str(k)] = round(float(v), 4)
-            elif isinstance(v, (np.bool_, bool)):
-                clean_fv[str(k)] = bool(v)
+            if shap_batch is not None:
+                top_shap_names, shap_drivers = _extract_shap_from_matrix(
+                    shap_batch, pe_idx, int(rep_pred_a["_class_idx"]), top_n=5
+                )
             else:
-                clean_fv[str(k)] = str(v)
+                shap_drivers = _compute_signed_shap_factors(rep_row, rep_inferred["event_type"], top_n=5)
+                top_shap_names = [d.feature for d in shap_drivers[:3]]
 
-        _SCORED_CACHE[event_id] = {
-            "response": item,
-            "location_key": best["loc_key"],
-            "pixels": pixels_list,
-            "feature_vector": clean_fv,
-            "class_probabilities": rep_pred_a.get("probabilities", {}),
-        }
+            all_lats = [c["lat"] for c in scored_candidates]
+            all_lons = [c["lon"] for c in scored_candidates]
+            all_frps = [c["frp"] for c in scored_candidates]
+            all_ti4s = [c["ti4"] for c in scored_candidates]
+            all_confs = [c["conf"] for c in scored_candidates]
+            all_ts = [c["iso_ts"] for c in scored_candidates]
+
+            min_lon, max_lon = min(all_lons), max(all_lons)
+            min_lat, max_lat = min(all_lats), max(all_lats)
+            if abs(max_lon - min_lon) < 0.002:
+                min_lon -= 0.001
+                max_lon += 0.001
+            if abs(max_lat - min_lat) < 0.002:
+                min_lat -= 0.001
+                max_lat += 0.001
+
+            frp_total = round(float(sum(all_frps)), 1)
+            frp_max = round(float(max(all_frps)), 1)
+            ti4_max = round(float(max(all_ti4s)), 1)
+            conf_max = round(float(max(all_confs)), 1)
+            first_seen = min(all_ts)
+            last_seen = max(all_ts)
+
+            fac_id = str(rep_row.get("facility_id", best["loc_key"]))
+            fac_name = facility_names.get(fac_id) or facility_names.get(best["loc_key"])
+
+            observed_obj = ObservedData(
+                frp=frp_max,
+                frp_total=frp_total,
+                frp_max=frp_max,
+                brightness_ti4=ti4_max,
+                confidence=conf_max,
+                acq_date=best["acq_date"],
+                acq_time=best["acq_time"],
+                daynight=str(rep_row.get("daynight", "D")),
+                satellite=str(rep_row.get("satellite", "SNPP")),
+                land_cover=str(rep_row.get("land_cover", "unknown")),
+                nearest_industrial_type=best["ind_type"],
+                nearest_industrial_name=fac_name,
+                dist_to_industrial_m=round(best["dist_ind"], 1),
+            )
+
+            inferred_obj = InferredData(
+                event_type=rep_inferred["event_type"],
+                event_type_confidence=rep_inferred["event_type_confidence"],
+                z_score=round(float(rep_pred_b["z_score"]), 2),
+                is_anomalous=bool(rep_pred_b["is_anomalous"]),
+                anomaly_score_normalized=rep_inferred["anomaly_score_normalized"],
+                hazard_weight=rep_inferred["hazard_weight"],
+                exposure_factor=rep_inferred["exposure_factor"],
+                final_risk_score=rep_inferred["final_risk_score"],
+                escalating_24h=rep_inferred["escalating_24h"],
+                risk_24h=rep_inferred["risk_24h"],
+                needs_manual_review=rep_inferred["needs_manual_review"],
+                top_shap_features=top_shap_names,
+                top_shap_factors=shap_drivers,
+            )
+
+            centroid_lat = round(float(np.mean(all_lats)), 4)
+            centroid_lon = round(float(np.mean(all_lons)), 4)
+
+            item = HotspotResponse(
+                event_id=event_id,
+                location_key=best["loc_key"],
+                lat=centroid_lat,
+                lon=centroid_lon,
+                bbox=[
+                    round(min_lon, 5),
+                    round(min_lat, 5),
+                    round(max_lon, 5),
+                    round(max_lat, 5),
+                ],
+                pixel_count=len(scored_candidates),
+                first_seen=first_seen,
+                last_seen=last_seen,
+                observed=observed_obj,
+                inferred=inferred_obj,
+            )
+            results.append(item)
+
+            # Clean feature vector dictionary for JSON serialization
+            clean_fv: Dict[str, Any] = {}
+            for k, v in rep_row.to_dict().items():
+                if str(k).startswith("_"):
+                    continue
+                if pd.isna(v):
+                    clean_fv[str(k)] = None
+                elif isinstance(v, (np.integer, int)):
+                    clean_fv[str(k)] = int(v)
+                elif isinstance(v, (np.floating, float)):
+                    clean_fv[str(k)] = round(float(v), 4)
+                elif isinstance(v, (np.bool_, bool)):
+                    clean_fv[str(k)] = bool(v)
+                else:
+                    clean_fv[str(k)] = str(v)
+
+            _SCORED_CACHE[event_id] = {
+                "response": item,
+                "location_key": best["loc_key"],
+                "pixels": pixels_list,
+                "feature_vector": clean_fv,
+                "class_probabilities": rep_pred_a.get("probabilities", {}),
+            }
 
     # Sort descending by final_risk_score then frp_max
     results.sort(key=lambda r: (r.inferred.final_risk_score, r.observed.frp_max), reverse=True)
@@ -692,6 +831,7 @@ def load_models_on_startup():
     """
     Loads trained ML models, statistical baselines, and OSM facility cache into memory on server start.
     Logs clear diagnostics if any model artifacts are missing.
+    Spawns background near-real-time FIRMS refresh daemon if REFRESH_ENABLED is set.
     """
     print("[API] Initializing models and baselines on startup...")
     all_ok, missing, err_msg = ensure_models_loaded()
@@ -700,6 +840,13 @@ def load_models_on_startup():
     else:
         print(f"[API] WARNING: {err_msg}")
     _load_osm_facilities()
+
+    # Launch background FIRMS refresh worker if enabled
+    try:
+        from api.refresh_worker import start_refresh_daemon_if_enabled
+        start_refresh_daemon_if_enabled()
+    except Exception as exc:
+        print(f"[API] Warning: Could not initialize refresh worker daemon: {exc}")
 
 
 @app.get("/")
@@ -723,11 +870,15 @@ def root():
 def get_health():
     """
     Returns operational health, dataset currency timestamp (data_as_of), active event count,
+    refresh mode (live vs snapshot), last refresh timestamp, refresh status,
     and dynamically inspected model artifact metadata.
     If model artifacts are missing, returns status='error' with a clear message.
     """
     all_ok, missing, err_msg = ensure_models_loaded()
     data_as_of, active_count = _get_dataset_summary()
+
+    from api.refresh_worker import get_refresh_state
+    refresh_info = get_refresh_state()
 
     artifacts_meta = {
         "model_a": _inspect_artifact_file(
@@ -747,18 +898,21 @@ def get_health():
             is_loaded=Path(DB_PATH).exists(),
         ),
         "osm_cache": _inspect_artifact_file(
-            Path(OSM_CACHE_PATH),
-            is_loaded=Path(OSM_CACHE_PATH).exists(),
+            SLIM_FACILITIES_PATH if SLIM_FACILITIES_PATH.exists() else Path(OSM_CACHE_PATH),
+            is_loaded=SLIM_FACILITIES_PATH.exists() or Path(OSM_CACHE_PATH).exists(),
         ),
     }
 
     return HealthResponse(
         status="ok" if all_ok else "error",
-        error=err_msg,
-        missing_artifacts=missing,
+        mode=refresh_info["mode"],
         data_as_of=data_as_of,
+        last_refresh_at=refresh_info["last_refresh_at"],
+        refresh_status=refresh_info["refresh_status"],
         active_events_count=active_count,
+        missing_artifacts=missing,
         model_artifacts=artifacts_meta,
+        error=err_msg,
     )
 
 

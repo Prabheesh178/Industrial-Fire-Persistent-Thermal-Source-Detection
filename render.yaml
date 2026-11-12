@@ -10,9 +10,10 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.9
       - key: CORS_ORIGINS
-        value: "*"
-      - key: LIVE_FIRMS_POLL
-        value: "false"
-      - key: DEFAULT_REGION
-        value: "gujarat"
-
+        sync: false
+      - key: FIRMS_MAP_KEY
+        sync: false
+      - key: REFRESH_ENABLED
+        sync: false
+      - key: REFRESH_MINUTES
+        sync: false

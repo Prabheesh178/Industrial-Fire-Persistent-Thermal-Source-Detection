@@ -41,13 +41,19 @@ interface ArtifactInfo {
 
 interface HealthResponse {
   status: "ok" | "error";
-  error: string | null;
-  missing_artifacts: string[];
+  mode: "snapshot" | "live";
   data_as_of: string | null;  // Max acquisition timestamp in dataset (ISO-8601 UTC)
+  last_refresh_at: string | null; // Timestamp of most recent automated refresh (ISO-8601 UTC)
+  refresh_status: "ok" | "running" | string;
   active_events_count: number;
+  missing_artifacts: string[];
   model_artifacts: Record<string, ArtifactInfo>;
+  error: string | null;
 }
 ```
+
+> **Near-Real-Time Note**: Satellite NRT (Near-Real-Time) detections from VIIRS sensors arrive approximately **3 hours after the satellite overpass**, so `mode: "live"` represents near-real-time automated updates, not instantaneous observation.
+
 
 #### Sample Response Payload (`GET /health`)
 

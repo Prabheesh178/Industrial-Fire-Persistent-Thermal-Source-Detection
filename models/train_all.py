@@ -240,16 +240,87 @@ def run_training_pipeline(
     # STEP 1: Ingestion & Spatial Join (Boundary Distances)
     # -------------------------------------------------------------------------
     print("\n>>> [STEP 1/7] Ingesting NASA FIRMS Hotspots & OSM Infrastructure Geometries...")
-    df_raw = fetch_firms_hotspots(west=w, south=s, east=e, north=n, total_days=days)
+    raw_cache_path = DATA_DIR / "firms_raw.csv"
+    import pandas as pd
+    if raw_cache_path.exists() and (time.time() - raw_cache_path.stat().st_mtime < 3600):
+        print(f"[FIRMS] Reusing recent raw FIRMS cache from {raw_cache_path}...")
+        df_raw = pd.read_csv(raw_cache_path)
+    else:
+        df_raw = fetch_firms_hotspots(west=w, south=s, east=e, north=n, total_days=days)
+        if not df_raw.empty:
+            df_raw.to_csv(raw_cache_path, index=False)
+            print(f"[FIRMS] Saved {len(df_raw):,} raw observations to {raw_cache_path}")
+
     if df_raw.empty:
         raise RuntimeError("No hotspot data available to train or process pipeline.")
 
-    # Cache OSM infrastructure
-    fetch_osm_industrial_and_exposure(west=w, south=s, east=e, north=n)
+    # Cache OSM infrastructure (refresh if missing or only containing the 6-element synthetic fallback)
+    need_osm_refresh = True
+    if Path(OSM_CACHE_PATH).exists():
+        try:
+            with open(OSM_CACHE_PATH, "r", encoding="utf-8") as fh:
+                existing_osm = json.load(fh)
+            if len(existing_osm.get("elements", [])) >= 50:
+                need_osm_refresh = False
+        except Exception:
+            need_osm_refresh = True
+
+    if need_osm_refresh:
+        if target_region == "all_india":
+            print("[OSM] Fetching and merging OSM industrial facilities across Indian industrial belts...")
+            merged_elements = {}
+            seen_bboxes = set()
+            for sub_reg in REGIONS.keys():
+                if sub_reg == "all_india":
+                    continue
+                sub_box = get_region_bbox(sub_reg)
+                bbox_tuple = (sub_box["west"], sub_box["south"], sub_box["east"], sub_box["north"])
+                if bbox_tuple in seen_bboxes:
+                    continue
+                seen_bboxes.add(bbox_tuple)
+                print(f"  -> Querying Overpass for region '{sub_reg}'...")
+                sub_data = fetch_osm_industrial_and_exposure(
+                    west=sub_box["west"],
+                    south=sub_box["south"],
+                    east=sub_box["east"],
+                    north=sub_box["north"],
+                    force_refresh=True,
+                )
+                for el in sub_data.get("elements", []):
+                    key = (el.get("type"), el.get("id"))
+                    merged_elements[key] = el
+            merged_payload = {
+                "version": 0.6,
+                "generator": "Overpass API Multi-Region India Extract",
+                "elements": list(merged_elements.values()),
+            }
+            with open(OSM_CACHE_PATH, "w", encoding="utf-8") as fh:
+                json.dump(merged_payload, fh)
+            print(f"[OSM] Saved {len(merged_elements):,} unique OSM elements to {OSM_CACHE_PATH}")
+        else:
+            fetch_osm_industrial_and_exposure(west=w, south=s, east=e, north=n, force_refresh=True)
+    else:
+        fetch_osm_industrial_and_exposure(west=w, south=s, east=e, north=n)
 
     # Boundary distance spatial join
     df_joined = perform_spatial_join(df_raw, str(OSM_CACHE_PATH))
     print(f" -> Spatial Join complete: {len(df_joined)} points processed with boundary distances.")
+
+    # Bound N for O(N^2) DBSCAN distance matrix while preserving 100% of near-industrial detections
+    max_cluster_rows = 8500
+    if len(df_joined) > max_cluster_rows:
+        near_ind = df_joined[df_joined["dist_to_nearest_industrial_m"] <= 3000.0]
+        far_ind = df_joined[df_joined["dist_to_nearest_industrial_m"] > 3000.0]
+        remaining_budget = max(1000, max_cluster_rows - len(near_ind))
+        if len(far_ind) > remaining_budget:
+            far_ind = far_ind.sample(n=remaining_budget, random_state=42)
+        import pandas as pd
+        df_joined = pd.concat([near_ind, far_ind], ignore_index=True)
+        print(
+            f" -> Balanced nationwide sample to {len(df_joined):,} rows "
+            f"(kept all {len(near_ind):,} near-facility points + {len(far_ind):,} background points) "
+            f"to bound O(N^2) DBSCAN memory."
+        )
 
     # -------------------------------------------------------------------------
     # STEP 2: Spatiotemporal Clustering (DBSCAN) - BEFORE Feature Engineering

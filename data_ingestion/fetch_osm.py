@@ -219,32 +219,42 @@ def fetch_osm_industrial_and_exposure(
         try:
             with open(target_cache, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception as e:
-            print(f"[OSM] Error reading cache ({e}), re-fetching from API...")
+        except Exception as exc:
+            print(f"[OSM] Error reading cache ({exc}), re-fetching from API...")
 
     query = build_overpass_query(s, w, n, e)
-    print(f"[OSM] Querying Overpass API ({OVERPASS_URL}) for bbox [{w}, {s}, {e}, {n}]...")
-    
-    try:
-        response = requests.post(OVERPASS_URL, data={"data": query}, timeout=90)
-        if response.status_code == 200:
-            data = response.json()
-            elements_count = len(data.get("elements", []))
-            print(f"[OSM] Received {elements_count} OSM elements from Overpass.")
-            
-            if elements_count == 0:
-                print("[OSM] Query returned 0 elements, generating fallback geometric reference data.")
-                data = generate_fallback_osm_data(s, w, n, e)
+    headers = {
+        "User-Agent": "IndustrialFireDetectionSIH/1.0 (research; contact@sih-thermalwatch.in)",
+        "Accept": "application/json",
+    }
+    endpoints = [
+        "https://overpass.private.coffee/api/interpreter",
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+        OVERPASS_URL,
+    ]
 
-            target_cache.parent.mkdir(parents=True, exist_ok=True)
-            with open(target_cache, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            print(f"[OSM] Saved OSM geometries to cache: {target_cache}")
-            return data
-        else:
-            print(f"[OSM] Overpass HTTP Error {response.status_code}: {response.text[:200]}")
-    except Exception as e:
-        print(f"[OSM] Overpass connection failed: {e}")
+    for url in endpoints:
+        print(f"[OSM] Querying Overpass API ({url}) for bbox [{w}, {s}, {e}, {n}]...")
+        try:
+            response = requests.post(url, data={"data": query}, headers=headers, timeout=(10, 60))
+            if response.status_code == 200:
+                data = response.json()
+                elements_count = len(data.get("elements", []))
+                print(f"[OSM] Received {elements_count} OSM elements from Overpass ({url}).")
+
+                if elements_count == 0:
+                    print("[OSM] Query returned 0 elements, generating fallback geometric reference data.")
+                    data = generate_fallback_osm_data(s, w, n, e)
+
+                target_cache.parent.mkdir(parents=True, exist_ok=True)
+                with open(target_cache, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                print(f"[OSM] Saved OSM geometries to cache: {target_cache}")
+                return data
+            else:
+                print(f"[OSM] Overpass HTTP Error {response.status_code} from {url}: {response.text[:160]}")
+        except Exception as exc:
+            print(f"[OSM] Overpass connection failed on {url}: {exc}")
 
     # Fallback if network fails
     data = generate_fallback_osm_data(s, w, n, e)

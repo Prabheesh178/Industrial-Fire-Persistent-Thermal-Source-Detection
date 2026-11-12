@@ -172,15 +172,19 @@ class ArtifactInfo(BaseModel):
 class HealthResponse(BaseModel):
     """
     Service health, data currency timestamp, and artifact status from GET /health.
+    Supports both historical snapshot mode and live near-real-time refresh mode.
     """
     model_config = {"protected_namespaces": ()}
 
     status: str = Field(..., description="'ok' when all model artifacts are loaded, 'error' otherwise")
-    error: Optional[str] = Field(None, description="Clear error description if any required artifacts are missing")
-    missing_artifacts: List[str] = Field(default_factory=list)
+    mode: str = Field("snapshot", description="'live' when automated FIRMS refresh is enabled, 'snapshot' otherwise")
     data_as_of: Optional[str] = Field(None, description="Max acquisition timestamp in dataset (ISO-8601 UTC)")
+    last_refresh_at: Optional[str] = Field(None, description="Timestamp of most recent refresh completion (ISO-8601 UTC)")
+    refresh_status: str = Field("ok", description="'ok', 'running', or 'failed: <short reason>'")
     active_events_count: int = Field(0, description="Number of distinct event_id clusters currently available")
+    missing_artifacts: List[str] = Field(default_factory=list)
     model_artifacts: Dict[str, ArtifactInfo]
+    error: Optional[str] = Field(None, description="Clear error description if any required artifacts are missing")
 
 
 if __name__ == "__main__":

@@ -234,7 +234,7 @@ def compute_boundary_distances(
         for c, v in zip(cols, fill):
             if c not in j.columns:
                 j[c] = v
-            else:
+            elif v is not None:
                 j[c] = j[c].fillna(v)
         j["_d"] = j["_d"].fillna(dist_default)
         return j
