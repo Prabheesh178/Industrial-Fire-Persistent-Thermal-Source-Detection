@@ -58,6 +58,7 @@ DEPLOY_ALLOWLIST = [
     # Ingestion & processing modules needed for live refresh
     ("data_ingestion/__init__.py", "data_ingestion/__init__.py"),
     ("data_ingestion/fetch_firms.py", "data_ingestion/fetch_firms.py"),
+    ("data_ingestion/fetch_osm.py", "data_ingestion/fetch_osm.py"),
     ("data_ingestion/fetch_landcover.py", "data_ingestion/fetch_landcover.py"),
     ("data_ingestion/fetch_weather.py", "data_ingestion/fetch_weather.py"),
 
