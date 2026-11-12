@@ -45,9 +45,13 @@ python -m models.train_all --region odisha --days 30
 python -m models.train_all --region all_india --days 14
 ```
 
-### Step 4: Launch the FastAPI REST API Server
-Start the Uvicorn server:
+### Step 5: Export Runtime Serving Bundle for Render
+To export a clean, minimal runtime bundle containing only what the FastAPI service and automated FIRMS refresh engine need (without training data or uncompressed OSM caches):
 ```bash
+python export_deploy_bundle.py
+```
+This generates `../thermalwatch-api-deploy` containing all model artifacts, slim facilities, and serving code (~13.6 MB), ready for deployment to Render.
+
 uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 Interactive API documentation will be available at:
